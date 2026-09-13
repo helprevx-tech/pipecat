@@ -8,7 +8,7 @@
 
 import base64
 import json
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from loguru import logger
 
@@ -27,6 +27,10 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameProcessorSetup
 from pipecat.serializers.base_serializer import FrameSerializer
+from pipecat.utils.enums import EndTaskReason
+
+if TYPE_CHECKING:
+    from pipecat.serializers.call_strategies import HangupStrategy, TransferStrategy
 
 
 def _build_call_resource_url(
@@ -88,6 +92,8 @@ class TwilioFrameSerializer(FrameSerializer):
         auth_token: str | None = None,
         region: str | None = None,
         edge: str | None = None,
+        transfer_strategy: "TransferStrategy | None" = None,
+        hangup_strategy: "HangupStrategy | None" = None,
         base_url: str | None = None,
         params: InputParams | None = None,
     ):
@@ -100,6 +106,8 @@ class TwilioFrameSerializer(FrameSerializer):
             auth_token: Twilio auth token (required for auto hang-up).
             region: Twilio region (e.g., "au1", "ie1"). Must be specified with edge.
             edge: Twilio edge location (e.g., "sydney", "dublin"). Must be specified with region.
+            transfer_strategy: Strategy for handling call transfers.
+            hangup_strategy: Strategy for handling call hangups.
             base_url: Optional REST API base URL (scheme + host, e.g.
                 ``https://api.twilio.com``) used for auto hang-up. Defaults to the
                 host derived from region/edge. Set this to target a Twilio-API-
@@ -123,7 +131,8 @@ class TwilioFrameSerializer(FrameSerializer):
 
             if missing_credentials:
                 raise ValueError(
-                    f"auto_hang_up is enabled but missing required parameters: {', '.join(missing_credentials)}"
+                    f"auto_hang_up is enabled but missing required parameters: "
+                    f"{', '.join(missing_credentials)}"
                 )
 
             # Validate region and edge are both provided if either is specified.
@@ -142,6 +151,8 @@ class TwilioFrameSerializer(FrameSerializer):
         self._auth_token = auth_token
         self._region = region
         self._edge = edge
+        self._transfer_strategy = transfer_strategy
+        self._hangup_strategy = hangup_strategy
         self._base_url = base_url
 
         self._twilio_sample_rate = self._params.twilio_sample_rate
@@ -154,6 +165,7 @@ class TwilioFrameSerializer(FrameSerializer):
             clear_after_secs=self._params.resampler_clear_after_secs
         )
         self._hangup_attempted = False
+        self._transfer_attempted = False
 
     async def setup(self, setup: FrameProcessorSetup):
         """Sets up the serializer with pipeline configuration.
@@ -175,14 +187,43 @@ class TwilioFrameSerializer(FrameSerializer):
         Returns:
             Serialized data as string or bytes, or None if the frame isn't handled.
         """
-        if (
-            self._params.auto_hang_up
-            and not self._hangup_attempted
-            and isinstance(frame, (EndFrame, CancelFrame))
-        ):
-            self._hangup_attempted = True
-            await self._hang_up_call()
-            return None
+        if isinstance(frame, (EndFrame, CancelFrame)):
+            frame_reason = getattr(frame, "reason", None)
+            logger.debug(f"Processing {type(frame).__name__} with reason: {frame_reason}")
+
+            if frame_reason == EndTaskReason.TRANSFER_CALL.value and not self._transfer_attempted:
+                self._transfer_attempted = True
+                if self._transfer_strategy:
+                    context = {
+                        "call_sid": self._call_sid,
+                        "account_sid": self._account_sid,
+                        "auth_token": self._auth_token,
+                        "region": self._region,
+                        "edge": self._edge,
+                        "base_url": self._base_url,
+                    }
+                    success = await self._transfer_strategy.execute_transfer(context)
+                    if not success:
+                        logger.error(f"Transfer strategy failed for call {self._call_sid}")
+                else:
+                    logger.warning(f"No transfer strategy configured for call {self._call_sid}")
+            elif self._params.auto_hang_up and not self._hangup_attempted:
+                self._hangup_attempted = True
+                if self._hangup_strategy:
+                    context = {
+                        "call_sid": self._call_sid,
+                        "account_sid": self._account_sid,
+                        "auth_token": self._auth_token,
+                        "region": self._region,
+                        "edge": self._edge,
+                        "base_url": self._base_url,
+                    }
+                    success = await self._hangup_strategy.execute_hangup(context)
+                    if not success:
+                        logger.error(f"Hangup strategy failed for call {self._call_sid}")
+                else:
+                    await self._hang_up_call()
+                return None
         elif isinstance(frame, InterruptionFrame):
             answer = {"event": "clear", "streamSid": self._stream_sid}
             return json.dumps(answer)

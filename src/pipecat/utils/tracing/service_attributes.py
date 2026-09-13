@@ -11,7 +11,10 @@ attributes to OpenTelemetry spans, following standard semantic conventions
 where applicable and Pipecat-specific conventions for additional context.
 """
 
-from typing import TYPE_CHECKING, Any, Optional
+import json
+from typing import TYPE_CHECKING, Any
+
+from pipecat.adapters.schemas.tools_schema import AdapterType, ToolsSchema
 
 # Import for type checking only
 if TYPE_CHECKING:
@@ -23,6 +26,61 @@ from pipecat.utils.tracing.setup import is_tracing_available
 
 if is_tracing_available():
     from opentelemetry.trace import Span
+
+
+def _span_tools(tools: Any | None, adapter_type: AdapterType | None = None) -> list[Any]:
+    """Return a concrete list of tools suitable for span attributes."""
+    if not tools:
+        return []
+
+    if isinstance(tools, ToolsSchema):
+        span_tools: list[Any] = list(tools.standard_tools)
+        if tools.custom_tools:
+            if adapter_type:
+                span_tools.extend(tools.custom_tools.get(adapter_type, []))
+            else:
+                for custom_tools in tools.custom_tools.values():
+                    span_tools.extend(custom_tools)
+        return span_tools
+
+    if isinstance(tools, list):
+        return tools
+
+    if isinstance(tools, tuple):
+        return list(tools)
+
+    return [tools]
+
+
+def _span_tool_names(tools: list[Any]) -> list[str]:
+    """Extract display names from common standard and provider-native tool formats."""
+    names: list[str] = []
+
+    for tool in tools:
+        if isinstance(tool, dict):
+            name = tool.get("name")
+            if isinstance(name, str):
+                names.append(name)
+
+            function = tool.get("function")
+            if isinstance(function, dict):
+                function_name = function.get("name")
+                if isinstance(function_name, str):
+                    names.append(function_name)
+
+            function_declarations = tool.get("function_declarations")
+            if isinstance(function_declarations, list):
+                for declaration in function_declarations:
+                    if isinstance(declaration, dict):
+                        declaration_name = declaration.get("name")
+                        if isinstance(declaration_name, str):
+                            names.append(declaration_name)
+        elif hasattr(tool, "name"):
+            name = getattr(tool, "name", None)
+            if isinstance(name, str):
+                names.append(name)
+
+    return names
 
 
 def _get_provider_name_from_service_name(service_name: str) -> str:
@@ -70,7 +128,7 @@ def add_tts_span_attributes(
     model: str,
     voice_id: str,
     text: str | None = None,
-    settings: Optional["ServiceSettings"] = None,
+    settings: "ServiceSettings | None" = None,
     character_count: int | None = None,
     operation_name: str = "tts",
     ttfb: float | None = None,
@@ -99,7 +157,7 @@ def add_tts_span_attributes(
 
     # Add optional attributes
     if text:
-        span.set_attribute("text", text)
+        span.set_attribute("input", text)
 
     if character_count is not None:
         span.set_attribute("metrics.character_count", character_count)
@@ -128,7 +186,7 @@ def add_stt_span_attributes(
     is_final: bool | None = None,
     language: str | None = None,
     user_id: str | None = None,
-    settings: Optional["ServiceSettings"] = None,
+    settings: "ServiceSettings | None" = None,
     vad_enabled: bool = False,
     ttfb: float | None = None,
     **kwargs,
@@ -157,7 +215,7 @@ def add_stt_span_attributes(
 
     # Add optional attributes
     if transcript:
-        span.set_attribute("transcript", transcript)
+        span.set_attribute("output", transcript)
 
     if is_final is not None:
         span.set_attribute("is_final", is_final)
@@ -188,12 +246,10 @@ def add_llm_span_attributes(
     service_name: str,
     model: str,
     stream: bool = True,
-    messages: str | None = None,
+    messages: Any | None = None,
+    tools: Any | None = None,
     output: str | None = None,
-    tools: str | None = None,
-    tool_count: int | None = None,
     tool_choice: str | None = None,
-    system_instructions: str | None = None,
     parameters: dict[str, Any] | None = None,
     extra_parameters: dict[str, Any] | None = None,
     ttfb: float | None = None,
@@ -206,12 +262,10 @@ def add_llm_span_attributes(
         service_name: Name of the LLM service (e.g., "openai").
         model: Model name/identifier.
         stream: Whether streaming is enabled.
-        messages: JSON-serialized messages.
+        messages: messages.
+        tools: tools configuration.
         output: Aggregated output text from the LLM.
-        tools: JSON-serialized tools configuration.
-        tool_count: Number of tools available.
         tool_choice: Tool selection configuration.
-        system_instructions: System instructions.
         parameters: Service parameters.
         extra_parameters: Additional parameters.
         ttfb: Time to first byte in seconds.
@@ -224,24 +278,24 @@ def add_llm_span_attributes(
     span.set_attribute("gen_ai.output.type", "text")
     span.set_attribute("stream", stream)
 
+    span_input: dict[str, Any] = {}
+
     # Add optional attributes
     if messages:
-        span.set_attribute("input", messages)
+        span_input["messages"] = messages
 
     if output:
         span.set_attribute("output", output)
 
     if tools:
-        span.set_attribute("tools", tools)
+        span_input["tools"] = tools
 
-    if tool_count is not None:
-        span.set_attribute("tool_count", tool_count)
+    # Set input in ChatML format when available
+    if span_input:
+        span.set_attribute("input", json.dumps(span_input, default=str))
 
     if tool_choice:
         span.set_attribute("tool_choice", tool_choice)
-
-    if system_instructions:
-        span.set_attribute("gen_ai.system_instructions", system_instructions)
 
     if ttfb is not None:
         span.set_attribute("metrics.ttfb", ttfb)
@@ -284,7 +338,7 @@ def add_gemini_live_span_attributes(
     voice_id: str | None = None,
     language: str | None = None,
     modalities: str | None = None,
-    settings: Optional["ServiceSettings"] = None,
+    settings: "ServiceSettings | None" = None,
     tools: list[dict] | None = None,
     tools_serialized: str | None = None,
     transcript: str | None = None,
@@ -339,19 +393,13 @@ def add_gemini_live_span_attributes(
     if audio_data_size is not None:
         span.set_attribute("audio.data_size_bytes", audio_data_size)
 
-    if tools:
-        span.set_attribute("tools.count", len(tools))
+    span_tools = _span_tools(tools, AdapterType.GEMINI)
+    if span_tools:
+        span.set_attribute("tools.count", len(span_tools))
         span.set_attribute("tools.available", True)
 
         # Add individual tool names for easier filtering
-        tool_names = []
-        for tool in tools:
-            if isinstance(tool, dict) and "name" in tool:
-                tool_names.append(tool["name"])
-            elif hasattr(tool, "name"):
-                tool_name = getattr(tool, "name", None)
-                if tool_name is not None:
-                    tool_names.append(tool_name)
+        tool_names = _span_tool_names(span_tools)
 
         if tool_names:
             span.set_attribute("tools.names", ",".join(tool_names))
@@ -431,19 +479,13 @@ def add_openai_realtime_span_attributes(
     if audio_data_size is not None:
         span.set_attribute("audio.data_size_bytes", audio_data_size)
 
-    if tools:
-        span.set_attribute("tools.count", len(tools))
+    span_tools = _span_tools(tools, AdapterType.OPENAI)
+    if span_tools:
+        span.set_attribute("tools.count", len(span_tools))
         span.set_attribute("tools.available", True)
 
         # Add individual tool names for easier filtering
-        tool_names = []
-        for tool in tools:
-            if isinstance(tool, dict) and "name" in tool:
-                tool_names.append(tool["name"])
-            elif hasattr(tool, "name"):
-                tool_names.append(getattr(tool, "name"))  # noqa: B009
-            elif isinstance(tool, dict) and "function" in tool and "name" in tool["function"]:
-                tool_names.append(tool["function"]["name"])
+        tool_names = _span_tool_names(span_tools)
 
         if tool_names:
             span.set_attribute("tools.names", ",".join(tool_names))

@@ -16,11 +16,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from loguru import logger
+from opentelemetry.context import Context
 
 from pipecat.frames.frames import StartFrame
 from pipecat.observers.base_observer import BaseObserver, FramePushed
 from pipecat.observers.turn_tracking_observer import TurnTrackingObserver
 from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
+from pipecat.utils.tracing.langfuse_helpers import mark_trace_public
 from pipecat.utils.tracing.setup import is_tracing_available
 from pipecat.utils.tracing.tracing_context import TracingContext
 
@@ -49,6 +51,8 @@ class TurnTraceObserver(BaseObserver):
         turn_tracker: TurnTrackingObserver,
         latency_tracker: UserBotLatencyObserver,
         conversation_id: str | None = None,
+        conversation_parent_context: Context | None = None,
+        conversation_type: str = "voice",
         additional_span_attributes: dict | None = None,
         tracing_context: TracingContext | None = None,
         **kwargs,
@@ -59,6 +63,12 @@ class TurnTraceObserver(BaseObserver):
             turn_tracker: The turn tracking observer to monitor.
             latency_tracker: The latency tracking observer for user-bot latency.
             conversation_id: Optional conversation ID for grouping turns.
+            conversation_parent_context: Optional OpenTelemetry context whose
+                active span carries a fixed trace id. When provided, the
+                conversation span is created under it instead of as a new root,
+                letting independent pipelines share one trace.
+            conversation_type: Value for the ``conversation.type`` span attribute
+                (e.g. ``"voice"`` or ``"text"``).
             additional_span_attributes: Additional attributes to add to spans.
             tracing_context: Pipeline-scoped tracing context for span hierarchy.
             **kwargs: Additional arguments passed to parent class.
@@ -75,6 +85,8 @@ class TurnTraceObserver(BaseObserver):
         # Conversation tracking properties
         self._conversation_span: Span | None = None
         self._conversation_id = conversation_id
+        self._conversation_parent_context = conversation_parent_context
+        self._conversation_type = conversation_type
         self._additional_span_attributes = additional_span_attributes or {}
 
         @turn_tracker.event_handler("on_turn_started")
@@ -133,12 +145,32 @@ class TurnTraceObserver(BaseObserver):
 
         self._conversation_id = conversation_id
 
-        # Create a new span for this conversation
-        self._conversation_span = self._tracer.start_span("conversation")
+        # Create a new span for this conversation.
+        #
+        # By default we pass an empty Context() so the conversation span is a
+        # ROOT span (no parent). This matters because an ambient span from the
+        # caller (e.g. an HTTP request handler) would otherwise capture the
+        # conversation as its child, and the langfuse.trace.public attribute
+        # wouldn't land on the real root span.
+        #
+        # When a caller supplies ``conversation_parent_context`` (a remote
+        # context carrying a fixed trace id), we honor it instead so several
+        # independent pipelines — e.g. one per turn of a stateless text-chat
+        # session — export their spans into a single shared Langfuse trace.
+        parent_context = self._conversation_parent_context or Context()
+        self._conversation_span = self._tracer.start_span("conversation", context=parent_context)
 
         # Set span attributes
         self._conversation_span.set_attribute("conversation.id", conversation_id)
-        self._conversation_span.set_attribute("conversation.type", "voice")
+        self._conversation_span.set_attribute("conversation.type", self._conversation_type)
+
+        # Make trace public so it can be shared via URL without authentication.
+        # This is also set on child service spans (LLM, TTS, STT) in service_decorators.py
+        # because BatchSpanProcessor exports spans when they END, so child spans may arrive
+        # at Langfuse before the parent conversation span. Whichever span arrives first
+        # creates the trace, so all spans need this attribute.
+        mark_trace_public(self._conversation_span)
+
         # Set custom otel attributes if provided
         for k, v in (self._additional_span_attributes or {}).items():
             self._conversation_span.set_attribute(k, v)
@@ -193,7 +225,7 @@ class TurnTraceObserver(BaseObserver):
             parent_context = self._tracing_context.get_conversation_context()
 
         # Create a new span for this turn
-        self._current_span = self._tracer.start_span("turn", context=parent_context)
+        self._current_span = self._tracer.start_span(f"turn-{turn_number}", context=parent_context)
         self._current_turn_number = turn_number
 
         # Set span attributes
@@ -260,3 +292,42 @@ class TurnTraceObserver(BaseObserver):
             return None
 
         return self._trace_context_map.get(turn_number)
+
+    def get_trace_id(self) -> str | None:
+        """Get the trace ID for the current conversation.
+
+        Returns:
+            The trace ID as a 32-character lowercase hex string, or None if unavailable.
+        """
+        if not is_tracing_available() or not self._conversation_span:
+            return None
+
+        try:
+            span_context = self._conversation_span.get_span_context()
+            # Format as 32-character lowercase hex string (Langfuse format)
+            return format(span_context.trace_id, "032x")
+        except Exception as e:
+            logger.warning(f"Failed to get trace ID: {e}")
+            return None
+
+    def get_trace_url(self) -> str | None:
+        """Get the Langfuse URL for the current conversation trace.
+
+        This URL can be used to view the trace in the Langfuse UI.
+        The trace is public and can be shared without authentication.
+
+        Returns:
+            The Langfuse URL for the trace, or None if unavailable.
+        """
+        trace_id = self.get_trace_id()
+        if trace_id is None:
+            return None
+
+        try:
+            from langfuse import get_client
+
+            langfuse = get_client()
+            return langfuse.get_trace_url(trace_id=trace_id)
+        except Exception as e:
+            logger.warning(f"Failed to get trace URL: {e}")
+            return None

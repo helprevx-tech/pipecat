@@ -8,7 +8,7 @@
 
 import base64
 import json
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from loguru import logger
 
@@ -27,6 +27,10 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameProcessorSetup
 from pipecat.serializers.base_serializer import FrameSerializer
+from pipecat.utils.enums import EndTaskReason
+
+if TYPE_CHECKING:
+    from pipecat.serializers.call_strategies import HangupStrategy, TransferStrategy
 
 
 class PlivoFrameSerializer(FrameSerializer):
@@ -61,6 +65,8 @@ class PlivoFrameSerializer(FrameSerializer):
         call_id: str | None = None,
         auth_id: str | None = None,
         auth_token: str | None = None,
+        transfer_strategy: "TransferStrategy | None" = None,
+        hangup_strategy: "HangupStrategy | None" = None,
         params: InputParams | None = None,
     ):
         """Initialize the PlivoFrameSerializer.
@@ -70,6 +76,8 @@ class PlivoFrameSerializer(FrameSerializer):
             call_id: The associated Plivo Call ID (optional, but required for auto hang-up).
             auth_id: Plivo auth ID (required for auto hang-up).
             auth_token: Plivo auth token (required for auto hang-up).
+            transfer_strategy: Strategy invoked when the pipeline ends for a transfer.
+            hangup_strategy: Strategy invoked for ordinary pipeline termination.
             params: Configuration parameters.
         """
         params = params or PlivoFrameSerializer.InputParams()
@@ -95,6 +103,8 @@ class PlivoFrameSerializer(FrameSerializer):
         self._call_id = call_id
         self._auth_id = auth_id
         self._auth_token = auth_token
+        self._transfer_strategy = transfer_strategy
+        self._hangup_strategy = hangup_strategy
 
         self._plivo_sample_rate = self._params.plivo_sample_rate
         self._sample_rate = 0  # Pipeline input rate
@@ -106,6 +116,7 @@ class PlivoFrameSerializer(FrameSerializer):
             clear_after_secs=self._params.resampler_clear_after_secs
         )
         self._hangup_attempted = False
+        self._transfer_attempted = False
 
     async def setup(self, setup: FrameProcessorSetup):
         """Sets up the serializer with pipeline configuration.
@@ -127,13 +138,34 @@ class PlivoFrameSerializer(FrameSerializer):
         Returns:
             Serialized data as string or bytes, or None if the frame isn't handled.
         """
-        if (
-            self._params.auto_hang_up
-            and not self._hangup_attempted
-            and isinstance(frame, (EndFrame, CancelFrame))
-        ):
-            self._hangup_attempted = True
-            await self._hang_up_call()
+        if isinstance(frame, (EndFrame, CancelFrame)):
+            frame_reason = getattr(frame, "reason", None)
+            context = {
+                "call_id": self._call_id,
+                "auth_id": self._auth_id,
+                "auth_token": self._auth_token,
+            }
+
+            if frame_reason == EndTaskReason.TRANSFER_CALL.value and not self._transfer_attempted:
+                self._transfer_attempted = True
+                if self._transfer_strategy:
+                    success = await self._transfer_strategy.execute_transfer(context)
+                    if not success:
+                        logger.error(f"Transfer strategy failed for Plivo call {self._call_id}")
+                else:
+                    logger.warning(
+                        f"No transfer strategy configured for Plivo call {self._call_id}"
+                    )
+                return None
+
+            if self._params.auto_hang_up and not self._hangup_attempted:
+                self._hangup_attempted = True
+                if self._hangup_strategy:
+                    success = await self._hangup_strategy.execute_hangup(context)
+                    if not success:
+                        logger.error(f"Hangup strategy failed for Plivo call {self._call_id}")
+                else:
+                    await self._hang_up_call()
             return None
         elif isinstance(frame, InterruptionFrame):
             answer = {"event": "clearAudio", "streamId": self._stream_id}
