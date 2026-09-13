@@ -205,6 +205,10 @@ class FunctionCallRegistryItem:
     timeout_secs: float | None = None
     cancellable_by_llm: bool = False
     auto_registered: bool = False
+    # Marked by register_function(is_node_transition=True): a workflow-control
+    # boundary (node transition, end-call, transfer) that realtime services may
+    # defer while the bot is still speaking.
+    is_node_transition: bool = False
 
 
 @dataclass
@@ -922,6 +926,7 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
         cancel_on_interruption: bool | None = None,
         timeout_secs: float | None = None,
         cancellable_by_llm: bool | None = None,
+        is_node_transition: bool = False,
     ):
         """Register a function handler for LLM function calls.
 
@@ -958,6 +963,11 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
                 until it returns, so there is no moment at which it could ask for
                 the call to stop. Defaults to ``None`` (fall back to the
                 ``@tool_options`` decorator value, then to False).
+            is_node_transition: Mark the function as a workflow-control boundary
+                (a node transition, end-call or transfer). Realtime services use
+                ``_function_is_node_transition`` to decide whether such a call may
+                run immediately or must wait for the current bot turn to finish.
+                Defaults to ``False``.
         """
         if function_name in self._cancel_tool_names:
             raise ValueError(
@@ -986,8 +996,17 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
             cancellable_by_llm=self._resolve_cancellable_by_llm(
                 function_name, cancellable_by_llm, handler, resolved_cancel_on_interruption
             ),
+            is_node_transition=is_node_transition,
         )
         self._record_tool_cleanup(handler)
+
+    def _function_is_node_transition(self, function_name: str | None) -> bool:
+        """Whether ``function_name`` was registered as a workflow-control boundary.
+
+        Set through ``register_function(..., is_node_transition=True)``.
+        """
+        item = self._functions.get(function_name)
+        return bool(item is not None and item.is_node_transition)
 
     def _record_tool_cleanup(self, handler: Any) -> None:
         """Track cleanup work a registered tool handler asks to run at teardown.
