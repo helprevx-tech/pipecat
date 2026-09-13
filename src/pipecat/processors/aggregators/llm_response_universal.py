@@ -124,6 +124,8 @@ class LLMUserAggregatorParams:
     """Parameters for configuring LLM user aggregation behavior.
 
     Parameters:
+        correct_aggregation_callback: Optional ``str -> str`` hook applied to the
+            aggregated assistant text before it is added to the context.
         add_tool_change_messages: When True, on each ``LLMSetToolsFrame`` the
             aggregator computes the diff against the currently advertised tools
             and appends a developer-role message to the context describing
@@ -251,6 +253,10 @@ class LLMAssistantAggregatorParams:
     # ``.. deprecated::`` directives in the class docstring above.
     enable_context_summarization: bool | None = None
     context_summarization_config: LLMContextSummarizationConfig | None = None
+    # Optional hook applied to the assistant turn text right before it is added
+    # to the context. Lets the application correct a corrupted aggregation
+    # (e.g. against the reference text it asked TTS to speak).
+    correct_aggregation_callback: Callable[[str], str] | None = None
 
     def __post_init__(self):
         if self.enable_context_summarization is not None:
@@ -1780,6 +1786,10 @@ class LLMAssistantAggregator(LLMContextAggregator):
 
         aggregation = self.aggregation_string()
         await self.reset()
+
+        correct = self._params.correct_aggregation_callback
+        if correct is not None:
+            aggregation = correct(aggregation)
 
         self._context.add_message({"role": "assistant", "content": aggregation})
 

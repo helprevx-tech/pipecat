@@ -293,6 +293,8 @@ class PipelineWorker(BaseWorker):
         check_dangling_tasks: bool = True,
         clock: BaseClock | None = None,
         conversation_id: str | None = None,
+        conversation_parent_context: Any = None,
+        conversation_type: str = "voice",
         enable_tracing: bool = False,
         enable_turn_tracking: bool = True,
         handle_flush_frame: bool | None = None,
@@ -446,6 +448,10 @@ class PipelineWorker(BaseWorker):
         self._start_timeout_secs = start_timeout_secs
         self._clock = clock or SystemClock()
         self._conversation_id = conversation_id
+        # Parent trace context and conversation kind ("voice", "text", ...) handed to
+        # the turn trace observer so a conversation's spans stitch onto their parent.
+        self._conversation_parent_context = conversation_parent_context
+        self._conversation_type = conversation_type
         self._enable_tracing = enable_tracing and is_tracing_available()
         self._enable_turn_tracking = enable_turn_tracking
         self._idle_timeout_secs = idle_timeout_secs
@@ -474,6 +480,8 @@ class PipelineWorker(BaseWorker):
                 self._turn_tracking_observer,
                 latency_tracker=self._user_bot_latency_observer,
                 conversation_id=self._conversation_id,
+                conversation_parent_context=self._conversation_parent_context,
+                conversation_type=self._conversation_type,
                 additional_span_attributes=self._additional_span_attributes,
                 tracing_context=self._tracing_context,
             )

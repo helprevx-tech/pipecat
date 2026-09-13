@@ -842,6 +842,9 @@ class TTSSpeakFrame(DataFrame):
 
     text: str
     append_to_context: bool = True
+    # Whether this spoken text should also be persisted to the call transcript /
+    # logs. Observers read it with getattr(frame, "persist_to_logs", False).
+    persist_to_logs: bool = False
 
     def __post_init__(self):
         super().__post_init__()
