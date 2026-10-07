@@ -11,6 +11,7 @@ rich information about service execution including configuration,
 parameters, and performance metrics.
 """
 
+import asyncio
 import functools
 import inspect
 import json
@@ -149,8 +150,9 @@ def _get_system_instruction(service, context) -> str | None:
     Returns:
         The system instruction text, or None if none is present.
     """
-    if hasattr(service, "_settings") and getattr(service._settings, "system_instruction", None):
-        return service._settings.system_instruction
+    system_instruction = getattr(getattr(service, "settings", None), "system_instruction", None)
+    if system_instruction:
+        return system_instruction
 
     if not context:
         return None
@@ -1121,6 +1123,16 @@ def traced_llm(func: Callable | None = None, *, name: str | None = None) -> Call
                         result = await f(self, context, *args, **kwargs)
                         return result
 
+                    except asyncio.CancelledError:
+                        # Cancellation is expected for interrupted turns and losing
+                        # fallback attempts; preserve it without marking a provider error.
+                        current_span.set_attribute(
+                            "langfuse.observation.status_message", "Cancelled"
+                        )
+                        current_span.set_attribute(
+                            "langfuse.observation.metadata.request_status", "cancelled"
+                        )
+                        raise
                     finally:
                         # Always restore the original methods
                         self.push_frame = original_push_frame

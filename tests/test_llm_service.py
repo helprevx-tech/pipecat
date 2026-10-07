@@ -28,8 +28,9 @@ from pipecat.frames.frames import (
     LLMContextFrame,
     LLMSetToolsFrame,
     LLMUpdateSettingsFrame,
+    NodeTransitionStartedFrame,
 )
-from pipecat.processors.aggregators.llm_context import NOT_GIVEN, LLMContext
+from pipecat.processors.aggregators.llm_context import NOT_GIVEN, LLMContext, LLMSpecificMessage
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.llm_service import (
     FunctionCallParams,
@@ -90,6 +91,39 @@ class TestUnparameterizedSubclass(unittest.TestCase):
         # should reflect that, regardless of how generics are erased.
         self.assertIsInstance(adapter, OpenAILLMAdapter)
         self.assertIsInstance(adapter, BaseLLMAdapter)
+
+
+class TestCreateLLMSpecificMessage(unittest.TestCase):
+    def test_legacy_adapter_supports_non_metadata_messages(self):
+        class LegacyAdapter(OpenAILLMAdapter):
+            def create_llm_specific_message(self, message):
+                return LLMSpecificMessage(llm="legacy", message=message)
+
+        class LegacyService(MockLLMService):
+            adapter_class = LegacyAdapter
+
+        service = LegacyService()
+        message = {"role": "assistant", "content": "Hello"}
+
+        for kwargs in ({}, {"is_metadata": False}):
+            with self.subTest(kwargs=kwargs):
+                result = service.create_llm_specific_message(message, **kwargs)
+
+                self.assertEqual(result.llm, "legacy")
+                self.assertIs(result.message, message)
+                self.assertFalse(result.is_metadata)
+
+    def test_metadata_aware_adapter_preserves_message_and_metadata_flag(self):
+        service = MockLLMService()
+        message = {"signature": "test"}
+
+        for is_metadata in (False, True):
+            with self.subTest(is_metadata=is_metadata):
+                result = service.create_llm_specific_message(message, is_metadata=is_metadata)
+
+                self.assertEqual(result.llm, service.get_llm_adapter().id_for_llm_specific_messages)
+                self.assertIs(result.message, message)
+                self.assertIs(result.is_metadata, is_metadata)
 
 
 class TestLLMService(unittest.IsolatedAsyncioTestCase):
@@ -265,6 +299,53 @@ class TestLLMService(unittest.IsolatedAsyncioTestCase):
             recorded_frames[2].result,
             _expected_missing_tool_message("doomed_tool"),
         )
+
+    async def test_node_transition_frame_is_acknowledged_before_function_starts(self):
+        service = MockLLMService()
+        service._requires_node_transition_context_aggregation = Mock(return_value=True)
+        service._call_event_handler = AsyncMock()
+        await self._run_function_calls_inline(service)
+
+        handler_started_after_ack = False
+
+        async def transition_handler(params):
+            nonlocal handler_started_after_ack
+            handler_started_after_ack = transition_frame.context_aggregation_event.is_set()
+            await params.result_callback({"status": "done"})
+
+        service.register_function(
+            "move_to_next_node",
+            transition_handler,
+            is_node_transition=True,
+        )
+
+        recorded_frames = []
+        transition_frame = None
+
+        async def mock_broadcast_frame(frame_cls, **kwargs):
+            nonlocal transition_frame
+            frame = frame_cls(**kwargs)
+            recorded_frames.append(frame)
+            if isinstance(frame, NodeTransitionStartedFrame):
+                transition_frame = frame
+                frame.context_aggregation_event.set()
+
+        service.broadcast_frame = mock_broadcast_frame
+
+        await service.run_function_calls(
+            [
+                FunctionCallFromLLM(
+                    function_name="move_to_next_node",
+                    tool_call_id="call_1",
+                    arguments={},
+                    context=LLMContext(),
+                )
+            ]
+        )
+
+        self.assertTrue(handler_started_after_ack)
+        self.assertEqual(type(recorded_frames[0]), NodeTransitionStartedFrame)
+        self.assertEqual(type(recorded_frames[1]), FunctionCallsStartedFrame)
 
     async def test_missing_function_call_dev_error_logged_as_error(self):
         """Tool advertised to the LLM but missing a handler → logger.error."""
@@ -838,6 +919,80 @@ class TestFunctionCallTimeout(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsInstance(frames[-1], FunctionCallResultFrame)
         self.assertEqual(frames[-1].result, {"ok": True})
+
+    async def test_intermediate_result_does_not_disarm_the_deadline(self):
+        """An update isn't a result, so it can't buy the handler more time."""
+        service, frames = self._service()
+        side_effects = []
+        rolled_back = []
+
+        async def progress_then_hang(params: FunctionCallParams):
+            try:
+                await params.result_callback(
+                    "working", properties=FunctionCallResultProperties(is_final=False)
+                )
+                await asyncio.sleep(self.HANDLER_DURATION)
+                side_effects.append(params.tool_call_id)
+                await params.result_callback({"ok": True})
+            except asyncio.CancelledError:
+                rolled_back.append(params.tool_call_id)
+                raise
+
+        service.register_function(
+            "progress",
+            progress_then_hang,
+            cancel_on_interruption=False,
+            timeout_secs=self.TIMEOUT,
+        )
+        await self._run_call(service, "progress")
+        await asyncio.sleep(self.SETTLE)
+
+        self.assertEqual(side_effects, [])
+        self.assertEqual(rolled_back, ["call_1"])
+        self.assertEqual(
+            [type(frame) for frame in frames],
+            [
+                FunctionCallsStartedFrame,
+                FunctionCallInProgressFrame,
+                FunctionCallResultFrame,
+                FunctionCallCancelFrame,
+            ],
+        )
+        self.assertFalse(frames[2].properties.is_final)
+        self.assertTrue(frames[-1].run_llm)
+
+    async def test_a_hanging_async_tool_times_out_without_any_update(self):
+        """Control for the test above, differing only in the missing update."""
+        service, frames = self._service()
+        rolled_back = []
+
+        async def hang(params: FunctionCallParams):
+            try:
+                await asyncio.sleep(self.HANDLER_DURATION)
+                await params.result_callback({"ok": True})
+            except asyncio.CancelledError:
+                rolled_back.append(params.tool_call_id)
+                raise
+
+        service.register_function(
+            "hang",
+            hang,
+            cancel_on_interruption=False,
+            timeout_secs=self.TIMEOUT,
+        )
+        await self._run_call(service, "hang")
+        await asyncio.sleep(self.SETTLE)
+
+        self.assertEqual(rolled_back, ["call_1"])
+        self.assertEqual(
+            [type(frame) for frame in frames],
+            [
+                FunctionCallsStartedFrame,
+                FunctionCallInProgressFrame,
+                FunctionCallCancelFrame,
+            ],
+        )
+        self.assertTrue(frames[-1].run_llm)
 
 
 class TestFunctionCallError(unittest.IsolatedAsyncioTestCase):

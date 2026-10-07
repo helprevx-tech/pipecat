@@ -86,6 +86,10 @@ def language_to_sarvam_language(language: Language) -> str:
         Language.OR_IN: "od-IN",
         Language.EN_IN: "en-IN",
         Language.AS_IN: "as-IN",
+        Language.UR_IN: "ur-IN",
+        Language.KOK_IN: "kok-IN",
+        Language.MAI_IN: "mai-IN",
+        Language.SD_IN: "sd-IN",
     }
 
     return resolve_language(language, LANGUAGE_MAP, use_base_code=False)
@@ -373,7 +377,11 @@ class SarvamSTTService(STTService):
         # mapping keys compare equal either way.
         language = cast(Language, assert_given(self._settings.language))
         if language:
-            return language_to_sarvam_language(language)
+            # Already a service code: STTService maps through
+            # language_to_service_language on init and on every settings update,
+            # and BCP-47 codes with no Language entry (ne-IN, sat-IN) pass
+            # through verbatim, which Sarvam accepts.
+            return language
         return self._config.default_language
 
     def can_generate_metrics(self) -> bool:
@@ -710,6 +718,12 @@ class SarvamSTTService(STTService):
                             time_now_iso8601(),
                             language,
                             result=(message.dict() if hasattr(message, "dict") else str(message)),
+                            # This service emits one transcript per utterance and
+                            # no interim frames, so every transcript it produces is
+                            # final. Without this, turn-stop strategies cannot take
+                            # their finalized fast path and wait out a timeout meant
+                            # for partial transcripts instead.
+                            finalized=True,
                         )
                     )
         except Exception as e:
@@ -797,6 +811,13 @@ class SarvamSTTService(STTService):
 
 
 _REALTIME_MODEL = "saaras:v3-realtime"
+
+# Sarvam's realtime endpoint serves both generations over the same connection
+# parameters and event protocol, so only the model string differs. The default
+# follows Sarvam's own, which is still v3. The second generation is named
+# `saaras:v4` here, without the `-realtime` suffix its predecessor carries: that
+# is the name the endpoint accepts, and it rejects `saaras:v4-realtime`.
+_SUPPORTED_REALTIME_MODELS = frozenset({"saaras:v3-realtime", "saaras:v4"})
 
 SUPPORTED_LANGUAGES = {
     "auto",
@@ -917,6 +938,10 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
 
     Streams raw audio bytes to Sarvam's realtime websocket endpoint and maps
     provider VAD and transcript events into Pipecat frames.
+
+    Serves ``saaras:v3-realtime`` and ``saaras:v4``, selected with
+    ``settings=SarvamRealtimeSTTService.Settings(model=...)`` and defaulting to
+    ``saaras:v3-realtime``, Sarvam's own default.
 
     With the default ``endpointing="vad"`` the server drives turn boundaries. With
     ``endpointing="manual"`` the pipeline drives them instead, so the pipeline
@@ -1532,8 +1557,9 @@ class SarvamRealtimeSTTService(WebsocketSTTService):
         block values Sarvam adds later.
         """
         model = assert_given(settings.model)
-        if model != _REALTIME_MODEL:
-            raise ValueError(f"Unsupported model '{model}'. Only '{_REALTIME_MODEL}' is supported.")
+        if model not in _SUPPORTED_REALTIME_MODELS:
+            allowed = ", ".join(sorted(_SUPPORTED_REALTIME_MODELS))
+            raise ValueError(f"Unsupported model '{model}'. Allowed values: {allowed}.")
 
     @traced_stt
     async def _trace_transcription(

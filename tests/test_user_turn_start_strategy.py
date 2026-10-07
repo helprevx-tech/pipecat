@@ -4,11 +4,14 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+import asyncio
 import unittest
 import warnings
+from unittest.mock import Mock
 
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
     InterimTranscriptionFrame,
     ProposedUserStartedSpeakingFrame,
     TranscriptionFrame,
@@ -16,6 +19,7 @@ from pipecat.frames.frames import (
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
+from pipecat.turns.types import ProcessFrameResult
 from pipecat.turns.user_start import (
     BaseUserTurnStartStrategy,
     ExternalUserTurnStartStrategy,
@@ -23,6 +27,8 @@ from pipecat.turns.user_start import (
     TranscriptionUserTurnStartStrategy,
     VADUserTurnStartStrategy,
 )
+from pipecat.utils.asyncio.task_manager import TaskManager, TaskManagerParams
+from tests.frame_processor_helpers import frame_processor_setup
 
 
 class TestMinWordsInterruptionStrategy(unittest.IsolatedAsyncioTestCase):

@@ -1,43 +1,60 @@
 #
-# Copyright (c) 2026, HelpRevX
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-"""User mute strategy that delegates the decision to a caller-supplied callback."""
+"""User mute strategy that delegates mute decisions to an external callback."""
 
-import inspect
-from typing import Awaitable, Callable, Union
+from collections.abc import Awaitable, Callable
 
 from pipecat.frames.frames import Frame
 from pipecat.turns.user_mute.base_user_mute_strategy import BaseUserMuteStrategy
 
-ShouldMuteCallback = Callable[[Frame], Union[bool, Awaitable[bool]]]
-
 
 class CallbackUserMuteStrategy(BaseUserMuteStrategy):
-    """Mute the user whenever ``should_mute_callback(frame)`` says so.
+    """User mute strategy that uses an external callback to determine mute state.
 
-    The other strategies in this package encode one fixed heuristic each. This
-    one hands the per-frame decision to the application, which is what a
-    workflow engine needs when the answer depends on its own state — e.g.
-    "the bot is speaking AND the current node forbids interruption", or "the
-    pipeline is shutting down". The callback receives every frame the strategy
-    sees, so it can also use them to track that state.
+    This strategy delegates the mute decision to a callback function provided
+    at construction time. The callback is invoked on each frame and should
+    return True if the user should be muted, False otherwise.
 
-    Args:
-        should_mute_callback: Called with each frame; returns ``True`` to mute
-            the user for that frame. May be sync or async.
-        **kwargs: Passed through to ``BaseUserMuteStrategy``.
+    This is useful when the mute logic depends on external state (e.g., the
+    current workflow node, bot speaking state, function call execution, etc.)
+    that is managed outside the strategy itself.
+
+    Example:
+        async def should_mute(frame: Frame) -> bool:
+            # Return True to mute, False to unmute
+            return engine.is_bot_speaking()
+
+        strategy = CallbackUserMuteStrategy(should_mute_callback=should_mute)
+
     """
 
-    def __init__(self, *, should_mute_callback: ShouldMuteCallback, **kwargs):
+    def __init__(
+        self,
+        should_mute_callback: Callable[[Frame], Awaitable[bool]],
+        **kwargs,
+    ):
+        """Initialize the callback user mute strategy.
+
+        Args:
+            should_mute_callback: An async callback function that takes a Frame
+                and returns True if the user should be muted, False otherwise.
+            **kwargs: Additional arguments passed to the base strategy.
+        """
         super().__init__(**kwargs)
         self._should_mute_callback = should_mute_callback
 
     async def process_frame(self, frame: Frame) -> bool:
-        """Return whether the user is muted for this frame, per the callback."""
-        result = self._should_mute_callback(frame)
-        if inspect.isawaitable(result):
-            result = await result
-        return bool(result)
+        """Process an incoming frame.
+
+        Args:
+            frame: The frame to be processed.
+
+        Returns:
+            Whether the strategy is muted (True = muted, False = not muted).
+        """
+        await super().process_frame(frame)
+        return await self._should_mute_callback(frame)

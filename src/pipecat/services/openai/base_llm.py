@@ -8,6 +8,7 @@
 
 import asyncio
 import json
+import re
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -29,7 +30,9 @@ from pydantic import BaseModel, Field
 
 from pipecat.adapters.services.open_ai_adapter import OpenAILLMAdapter, OpenAILLMInvocationParams
 from pipecat.frames.frames import (
+    BotStoppedSpeakingFrame,
     Frame,
+    FunctionCallsFromLLMInfoFrame,
     LLMContextFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
@@ -42,6 +45,7 @@ from pipecat.services.llm_service import FunctionCallFromLLM, LLMService
 from pipecat.services.settings import LLMSettings
 from pipecat.utils.deprecation import deprecated
 from pipecat.utils.http import TIMEOUT_EXCEPTIONS, connection_limits
+from pipecat.utils.text.alnum_utils import has_alnum
 from pipecat.utils.tracing.service_decorators import traced_llm
 from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given
 
@@ -72,6 +76,13 @@ class OpenAILLMSettings(LLMSettings):
     )
 
 
+# OpenAI models that predate strict JSON schema replies: gpt-3.5, gpt-4 and
+# gpt-4-turbo, the first gpt-4o snapshot, chatgpt-4o and the o1 previews.
+OPENAI_MODEL_WITHOUT_RESPONSE_SCHEMA = re.compile(
+    r"^(gpt-3\.5|gpt-4($|-)|gpt-4o-2024-05-13|chatgpt-4o|o1-mini|o1-preview)"
+)
+
+
 class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
     """Base class for all services that use the AsyncOpenAI client.
 
@@ -92,6 +103,10 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
     this to ``False``, which causes the adapter to convert "developer"
     messages to "user" messages before sending them to the API.
     """
+
+    supports_response_schema: bool = True
+    """Whether the API can enforce a response schema. OpenAI-compatible
+    services whose API cannot should set this to ``False``."""
 
     @deprecated(
         "`BaseOpenAILLMService.InputParams` is deprecated since 0.0.105 and will be removed in "
@@ -384,11 +399,23 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
 
         return params
 
+    @staticmethod
+    def model_supports_response_schema(model: str) -> bool:
+        """Whether a model can enforce a response schema.
+
+        OpenAI models before gpt-4o-mini and gpt-4o-2024-08-06 cannot.
+
+        Args:
+            model: The model name.
+        """
+        return not OPENAI_MODEL_WITHOUT_RESPONSE_SCHEMA.match(model)
+
     async def run_inference(
         self,
         context: LLMContext,
         max_tokens: int | None = None,
         system_instruction: str | None = None,
+        response_schema: dict[str, Any] | None = None,
     ) -> str | None:
         """Run a one-shot, out-of-band (i.e. out-of-pipeline) inference with the given LLM context.
 
@@ -398,6 +425,9 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                 overrides the service's default max_tokens/max_completion_tokens setting.
             system_instruction: Optional system instruction to use for this inference.
                 If provided, overrides any system instruction in the context.
+            response_schema: Optional JSON schema the reply must follow. The
+                service asks the provider to enforce it, so the reply is JSON
+                text matching the schema.
 
         Returns:
             The LLM's response as a string, or None if no response is generated.
@@ -427,6 +457,13 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
             else:
                 params["max_tokens"] = max_tokens
 
+        response_schema = self._check_response_schema(response_schema)
+        if response_schema is not None:
+            params["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "response", "schema": response_schema, "strict": True},
+            }
+
         # LLM completion
         response = await self._client.chat.completions.create(**params)
 
@@ -441,6 +478,12 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         function_name = ""
         arguments = ""
         tool_call_id = ""
+
+        response_generation = self._begin_tool_response()
+
+        # Content generated in the current completion, accumulated so the
+        # deferral decision below can ask whether any of it is speakable.
+        generated_content = ""
 
         await self.start_ttfb_metrics()
 
@@ -548,6 +591,7 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                             # Keep iterating through the response to collect all the argument fragments
                             arguments += tool_call.function.arguments
                     elif chunk.choices[0].delta.content:
+                        generated_content += chunk.choices[0].delta.content
                         await self._push_llm_text(chunk.choices[0].delta.content)
 
                     # When gpt-4o-audio / gpt-4o-mini-audio is used for llm or stt+llm
@@ -594,7 +638,26 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                     )
                 )
 
-            await self.run_function_calls(function_calls)
+            # Send the info frame with function calls so that it can be traced by service_decorators
+            await self.push_frame(
+                FunctionCallsFromLLMInfoFrame(function_calls=function_calls),
+                direction=FrameDirection.DOWNSTREAM,
+            )
+
+            # Unspeakable content (whitespace, punctuation, markup) never
+            # produces the BotStoppedSpeakingFrame that releases a deferred
+            # transition, so it must not count as generated text.
+            text_generated = has_alnum(generated_content)
+            if generated_content and not text_generated:
+                logger.info(
+                    f"{self}: no speakable content ({generated_content[:120]!r}); "
+                    "running function calls without waiting for TTS"
+                )
+            await self._run_or_defer_function_calls(
+                function_calls,
+                text_generated=text_generated,
+                response_generation=response_generation,
+            )
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Process frames for LLM completion requests.
@@ -607,7 +670,11 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         """
         await super().process_frame(frame, direction)
 
-        if isinstance(frame, LLMContextFrame):
+        # Handle BotStoppedSpeakingFrame to execute pending node-transition calls.
+        if isinstance(frame, BotStoppedSpeakingFrame):
+            await self._run_pending_node_transition_function_calls(frame)
+            await self.push_frame(frame, direction)
+        elif isinstance(frame, LLMContextFrame):
             try:
                 await self.push_frame(LLMFullResponseStartFrame())
                 await self.start_processing_metrics()

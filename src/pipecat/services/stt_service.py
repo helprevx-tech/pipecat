@@ -709,9 +709,12 @@ class STTService(AIService):
         try:
             await self._do_reconnect()
         except Exception as e:
-            logger.error(f"{self} reconnect failed: {e}")
+            msg = f"{self} reconnect failed: {e}"
+            # push_error is the report; a matching ERROR line would attribute
+            # this one failure a second time.
+            logger.warning(msg)
             await self._call_event_handler("on_connection_error", str(e))
-            await self.push_error(f"{self} reconnect failed: {e}", exception=e)
+            await self.push_error(msg, exception=e)
             return
         finally:
             self._reconnecting = False

@@ -40,7 +40,6 @@ from pipecat.frames.frames import (
     StartFrame,
     SystemFrame,
     TTSAudioRawFrame,
-    UninterruptibleFrame,
 )
 from pipecat.metrics.metrics import LLMTokenUsage, MetricsData, STTUsage
 from pipecat.observers.base_observer import BaseObserver, FrameProcessed, FramePushed
@@ -676,7 +675,7 @@ class FrameProcessor(BaseObject):
         """
         self._next = processor
         processor._prev = self
-        logger.debug(f"Linking {self} -> {self._next}")
+        logger.trace(f"Linking {self} -> {self._next}")
 
     def get_clock(self) -> BaseClock:
         """Get the clock used by this processor.
@@ -998,7 +997,9 @@ class FrameProcessor(BaseObject):
         else:
             error_message = f"{error.processor} error: {error.error}"
 
-        logger.error(error_message)
+        # ErrorFrame consumers decide how to classify and report the failure. This
+        # diagnostic mirror stays below ERROR so applications do not count it twice.
+        logger.debug(error_message)
         await self.push_frame(error, FrameDirection.UPSTREAM)
 
     async def push_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
@@ -1130,9 +1131,8 @@ class FrameProcessor(BaseObject):
     async def _start_interruption(self):
         """Start handling an interruption by cancelling current tasks."""
         try:
-            current_is_uninterruptible = isinstance(
-                self.__process_current_frame, UninterruptibleFrame
-            )
+            current = self.__process_current_frame
+            current_is_uninterruptible = current is not None and not current.interruptible
             if current_is_uninterruptible:
                 # The frame currently being processed is uninterruptible, so we
                 # must not cancel it. Just flush non-uninterruptible frames from
@@ -1241,15 +1241,14 @@ class FrameProcessor(BaseObject):
         """Reset non-system frame processing queue."""
         self.__process_queue.reset()
 
-    def has_queued_frame(self, frame_type: type[Frame] | type[UninterruptibleFrame]) -> bool:
+    def has_queued_frame(self, frame_type: type[Frame]) -> bool:
         """Return True if a frame of the given type is waiting in the processing queue.
 
         Delegates to :meth:`FrameQueue.has_frame` so the check is O(distinct
-        enqueued types) with no queue scanning.  ``frame_type`` may be any
-        ``Frame`` subclass or ``UninterruptibleFrame`` (a mixin).
+        enqueued types) with no queue scanning.
 
         Args:
-            frame_type: The frame class (or mixin) to look for.
+            frame_type: The frame class to look for.
 
         Returns:
             True if at least one matching frame is queued.

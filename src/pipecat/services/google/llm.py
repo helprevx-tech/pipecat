@@ -13,6 +13,7 @@ including LLM services, context management, and message aggregation.
 import asyncio
 import io
 import os
+import re
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import aclosing
@@ -27,7 +28,9 @@ from pipecat.adapters.base_llm_adapter import LLMContextConversionError
 from pipecat.adapters.services.gemini_adapter import GeminiLLMAdapter
 from pipecat.frames.frames import (
     AssistantImageRawFrame,
+    BotStoppedSpeakingFrame,
     Frame,
+    FunctionCallsFromLLMInfoFrame,
     LLMContextFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
@@ -44,6 +47,7 @@ from pipecat.services.google.utils import update_google_client_http_options
 from pipecat.services.llm_service import FunctionCallFromLLM, LLMService
 from pipecat.services.settings import LLMSettings
 from pipecat.utils.deprecation import deprecated
+from pipecat.utils.text.alnum_utils import has_alnum
 from pipecat.utils.tracing.service_decorators import traced_llm
 from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given, is_given
 
@@ -73,6 +77,7 @@ except ModuleNotFoundError as e:
 # model that isn't listed is assumed to accept "minimal", the fastest setting.
 _LOWEST_MODEL_THINKING_LEVELS = {
     "gemini-3.7-flash": "low",
+    "gemini-3.8-flash": "low",
 }
 
 # Models that take their thinking configuration from thinking_level, keyed by
@@ -90,8 +95,8 @@ class GoogleThinkingConfig(BaseModel):
     Parameters:
         thinking_level: Thinking level, for Gemini 3 models.
             Gemini 3 Flash accepts "minimal", "low", "medium", and "high",
-            except Gemini 3.7 Flash, which accepts only "low", "medium", and
-            "high". Gemini 3 Pro accepts "low" and "high".
+            except Gemini 3.7 Flash and Gemini 3.8 Flash, which accept only
+            "low", "medium", and "high". Gemini 3 Pro accepts "low" and "high".
             If not provided, the flash models default to "medium" and Pro
             defaults to "high".
             Note: Gemini 2.5 series must use thinking_budget instead.
@@ -166,6 +171,8 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
 
     # Overriding the default adapter to use the Gemini one.
     adapter_class = GeminiLLMAdapter
+
+    supports_response_schema: bool = True
 
     # Backward compatibility: ThinkingConfig used to be defined inline here.
     ThinkingConfig = GoogleThinkingConfig
@@ -334,11 +341,27 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         """Create the Gemini client instance. Subclasses can override this."""
         self._client = genai.Client(api_key=self._api_key, http_options=self._http_options)
 
+    @staticmethod
+    def model_supports_response_schema(model: str) -> bool:
+        """Whether a model can enforce a response schema.
+
+        Gemini takes a JSON schema from the 2.5 models on. A model id without
+        a version is assumed to support it.
+
+        Args:
+            model: The model name.
+        """
+        match = re.search(r"gemini(?:-[a-z]+)*-(\d+)(?:\.(\d+))?", model)
+        if not match:
+            return True
+        return (int(match.group(1)), int(match.group(2) or 0)) >= (2, 5)
+
     async def run_inference(
         self,
         context: LLMContext,
         max_tokens: int | None = None,
         system_instruction: str | None = None,
+        response_schema: dict[str, Any] | None = None,
     ) -> str | None:
         """Run a one-shot, out-of-band (i.e. out-of-pipeline) inference with the given LLM context.
 
@@ -348,6 +371,9 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
                 overrides the service's default max_tokens setting.
             system_instruction: Optional system instruction to use for this inference.
                 If provided, overrides any system instruction in the context.
+            response_schema: Optional JSON schema the reply must follow. The
+                service asks the provider to enforce it, so the reply is JSON
+                text matching the schema.
 
         Returns:
             The LLM's response as a string, or None if no response is generated.
@@ -360,7 +386,9 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         )
         adapter = self.get_llm_adapter()
         params = adapter.get_llm_invocation_params(
-            context, system_instruction=effective_instruction
+            context,
+            system_instruction=effective_instruction,
+            ensure_last_message_is_user=self._should_inject_trailing_user_message(),
         )
         messages = params["messages"]
         system = params["system_instruction"]
@@ -374,6 +402,11 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         # Override max_output_tokens if provided
         if max_tokens is not None:
             generation_params["max_output_tokens"] = max_tokens
+
+        response_schema = self._check_response_schema(response_schema)
+        if response_schema is not None:
+            generation_params["response_mime_type"] = "application/json"
+            generation_params["response_json_schema"] = response_schema
 
         generation_config = GenerateContentConfig(**generation_params)
 
@@ -509,10 +542,36 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         except Exception as e:
             logger.error(f"Failed to unset thinking budget: {e}")
 
+    # Models known to accept a request whose contents end with a model turn,
+    # continuing that turn as the start of the response. Newer models reject
+    # such requests, so this is a frozen legacy set: any model NOT matching is
+    # assumed to reject them and gets a trailing user message injected when
+    # needed. gemini-3.5-flash accepts them but shares a prefix with
+    # gemini-3.5-flash-lite, which doesn't, so it's left out.
+    _PREFILL_SUPPORTED_PATTERNS = (
+        "gemini-2.",
+        "gemini-3-",
+        "gemini-3.1-",
+        "gemini-pro-latest",
+    )
+
+    def _should_inject_trailing_user_message(self) -> bool:
+        """Whether to fix up requests whose contents end with a model turn.
+
+        Models without support for continuing a trailing model turn reject such
+        requests, so injection is on for every model not known to support it.
+        Subclasses with other model naming can override
+        ``_PREFILL_SUPPORTED_PATTERNS``.
+        """
+        model = self._settings.model or ""
+        return not any(model.startswith(p) for p in self._PREFILL_SUPPORTED_PATTERNS)
+
     async def _stream_content(self, context: LLMContext) -> AsyncIterator[GenerateContentResponse]:
         adapter = self.get_llm_adapter()
         params = adapter.get_llm_invocation_params(
-            context, system_instruction=assert_given(self._settings.system_instruction)
+            context,
+            system_instruction=assert_given(self._settings.system_instruction),
+            ensure_last_message_is_user=self._should_inject_trailing_user_message(),
         )
 
         logger.debug(
@@ -660,6 +719,7 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
 
     @traced_llm
     async def _process_context(self, context: LLMContext):
+        response_generation = self._begin_tool_response()
         await self.push_frame(LLMFullResponseStartFrame())
 
         prompt_tokens = 0
@@ -783,7 +843,8 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
                                                         "type": "thought_signature",
                                                         "signature": part.thought_signature,
                                                         "bookmark": bookmark,
-                                                    }
+                                                    },
+                                                    is_metadata=True,
                                                 )
                                             ]
                                         )
@@ -831,7 +892,29 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
                     if candidate.finish_reason:
                         self._handle_finish_reason(candidate.finish_reason)
 
-            await self.run_function_calls(function_calls)
+            # Handle function calls if any were collected
+            if function_calls:
+                # Send the info frame with function calls so that it can be traced by service_decorators
+                await self.push_frame(
+                    FunctionCallsFromLLMInfoFrame(function_calls=function_calls),
+                    direction=FrameDirection.DOWNSTREAM,
+                )
+
+                # Defer function calls until after TTS only for speakable text.
+                # Unspeakable content (whitespace, punctuation, markup) never
+                # produces the BotStoppedSpeakingFrame that releases the
+                # deferral, so it must not count as generated text.
+                text_generated = has_alnum(accumulated_text)
+                if accumulated_text and not text_generated:
+                    logger.info(
+                        f"{self}: no speakable content ({accumulated_text[:120]!r}); "
+                        "running function calls without waiting for TTS"
+                    )
+                await self._run_or_defer_function_calls(
+                    function_calls,
+                    text_generated=text_generated,
+                    response_generation=response_generation,
+                )
         except (TimeoutError, DeadlineExceeded) as e:
             await self._call_event_handler("on_completion_timeout")
             await self.push_error(error_msg="LLM completion timeout", exception=e)
@@ -868,7 +951,11 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         """
         await super().process_frame(frame, direction)
 
-        if isinstance(frame, LLMContextFrame):
+        # Handle BotStoppedSpeakingFrame to execute pending function calls
+        if isinstance(frame, BotStoppedSpeakingFrame):
+            await self._run_pending_node_transition_function_calls(frame)
+            await self.push_frame(frame, direction)
+        elif isinstance(frame, LLMContextFrame):
             await self._process_context(frame.context)
         else:
             await self.push_frame(frame, direction)

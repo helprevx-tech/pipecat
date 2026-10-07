@@ -10,16 +10,127 @@ from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     CancelFrame,
+    InterruptionFrame,
+    UserMuteStartedFrame,
+    UserMuteStoppedFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
 )
+from pipecat.observers.base_observer import FramePushed
 from pipecat.observers.turn_tracking_observer import TurnTrackingObserver
 from pipecat.processors.filters.identity_filter import IdentityFilter
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.tests.utils import SleepFrame, run_test
 
 
 class TestTurnTrackingObserver(unittest.IsolatedAsyncioTestCase):
     """Tests for TurnTrackingObserver."""
+
+    async def test_noninterrupting_overlap_waits_for_both_speakers(self):
+        observer = TurnTrackingObserver(turn_end_timeout_secs=0.02)
+        events = []
+
+        @observer.event_handler("on_user_speech_stopped_for_turn")
+        async def user_stopped(_observer, turn, _data):
+            events.append(("user_stopped", turn))
+
+        @observer.event_handler("on_turn_ended")
+        async def ended(_observer, turn, _duration, interrupted):
+            events.append(("ended", turn, interrupted))
+
+        await run_test(
+            IdentityFilter(),
+            frames_to_send=[
+                BotStartedSpeakingFrame(),
+                UserStartedSpeakingFrame(enable_interruptions=False),
+                BotStoppedSpeakingFrame(),
+                SleepFrame(sleep=0.06),
+                UserStoppedSpeakingFrame(),
+                SleepFrame(sleep=0.06),
+            ],
+            expected_down_frames=[
+                BotStartedSpeakingFrame,
+                UserStartedSpeakingFrame,
+                BotStoppedSpeakingFrame,
+                UserStoppedSpeakingFrame,
+            ],
+            observers=[observer],
+        )
+        self.assertEqual(events, [("user_stopped", 1), ("ended", 1, False)])
+
+    async def test_explicit_interruption_ends_overlap_and_next_bot_owns_new_turn(self):
+        observer = TurnTrackingObserver(turn_end_timeout_secs=0.02)
+        events = []
+
+        @observer.event_handler("on_turn_ended")
+        async def ended(_observer, turn, _duration, interrupted):
+            events.append((turn, interrupted))
+
+        await run_test(
+            IdentityFilter(),
+            frames_to_send=[
+                BotStartedSpeakingFrame(),
+                UserStartedSpeakingFrame(enable_interruptions=False),
+                UserStoppedSpeakingFrame(),
+                InterruptionFrame(),
+                BotStoppedSpeakingFrame(),
+                BotStartedSpeakingFrame(),
+                BotStoppedSpeakingFrame(),
+                SleepFrame(sleep=0.06),
+            ],
+            expected_down_frames=[
+                BotStartedSpeakingFrame,
+                UserStartedSpeakingFrame,
+                UserStoppedSpeakingFrame,
+                InterruptionFrame,
+                BotStoppedSpeakingFrame,
+                BotStartedSpeakingFrame,
+                BotStoppedSpeakingFrame,
+            ],
+            observers=[observer],
+        )
+        self.assertEqual(events, [(1, True), (2, False)])
+
+    async def test_broadcast_siblings_emit_one_correlated_user_boundary(self):
+        """Upstream/downstream siblings represent one logical speaking event."""
+        turn_observer = TurnTrackingObserver()
+        processor = IdentityFilter()
+        user_speech_events = []
+
+        @turn_observer.event_handler("on_user_speech_started_for_turn")
+        async def on_user_speech_started_for_turn(observer, turn_number, data):
+            user_speech_events.append(("started", turn_number))
+
+        @turn_observer.event_handler("on_user_speech_stopped_for_turn")
+        async def on_user_speech_stopped_for_turn(observer, turn_number, data):
+            user_speech_events.append(("stopped", turn_number))
+
+        started_downstream = UserStartedSpeakingFrame()
+        started_upstream = UserStartedSpeakingFrame()
+        started_downstream.broadcast_sibling_id = started_upstream.id
+        started_upstream.broadcast_sibling_id = started_downstream.id
+        stopped_downstream = UserStoppedSpeakingFrame()
+        stopped_upstream = UserStoppedSpeakingFrame()
+        stopped_downstream.broadcast_sibling_id = stopped_upstream.id
+        stopped_upstream.broadcast_sibling_id = stopped_downstream.id
+
+        for frame, direction, timestamp in [
+            (started_downstream, FrameDirection.DOWNSTREAM, 1),
+            (started_upstream, FrameDirection.UPSTREAM, 2),
+            (stopped_downstream, FrameDirection.DOWNSTREAM, 3),
+            (stopped_upstream, FrameDirection.UPSTREAM, 4),
+        ]:
+            await turn_observer.on_push_frame(
+                FramePushed(
+                    source=processor,
+                    destination=processor,
+                    frame=frame,
+                    direction=direction,
+                    timestamp=timestamp,
+                )
+            )
+
+        self.assertEqual(user_speech_events, [("started", 1), ("stopped", 1)])
 
     async def test_normal_conversation_flow(self):
         """Test a normal conversation with two complete turns."""
@@ -94,6 +205,7 @@ class TestTurnTrackingObserver(unittest.IsolatedAsyncioTestCase):
 
         # Record start/end events with turn numbers
         turn_events = []
+        user_speech_events = []
 
         @turn_observer.event_handler("on_turn_started")
         async def on_turn_started(observer, turn_number):
@@ -102,6 +214,14 @@ class TestTurnTrackingObserver(unittest.IsolatedAsyncioTestCase):
         @turn_observer.event_handler("on_turn_ended")
         async def on_turn_ended(observer, turn_number, duration, was_interrupted):
             turn_events.append(f"Turn {turn_number} ended (interrupted: {was_interrupted})")
+
+        @turn_observer.event_handler("on_user_speech_started_for_turn")
+        async def on_user_speech_started_for_turn(observer, turn_number, data):
+            user_speech_events.append(("started", turn_number))
+
+        @turn_observer.event_handler("on_user_speech_stopped_for_turn")
+        async def on_user_speech_stopped_for_turn(observer, turn_number, data):
+            user_speech_events.append(("stopped", turn_number))
 
         frames_to_send = [
             # Turn 1 - User speaks twice before bot responds
@@ -148,12 +268,23 @@ class TestTurnTrackingObserver(unittest.IsolatedAsyncioTestCase):
             "Turn 2 ended (interrupted: False)",
         ]
         self.assertEqual(turn_events, expected_events)
+        self.assertEqual(
+            user_speech_events,
+            [
+                ("started", 1),
+                ("stopped", 1),
+                ("started", 1),
+                ("stopped", 1),
+                ("started", 2),
+                ("stopped", 2),
+            ],
+        )
         self.assertEqual(turn_observer._turn_count, 2)
 
     async def test_user_interrupts_bot(self):
         """Test when user interrupts bot speaking, should end current turn and start new one.
 
-        Note: This test also verifies that the EndFrame ends the turn correctly.
+        EndFrame must leave the final turn active for downstream tracing cleanup.
         """
         # Create observer with a short timeout
         turn_observer = TurnTrackingObserver(turn_end_timeout_secs=0.2)
@@ -201,9 +332,47 @@ class TestTurnTrackingObserver(unittest.IsolatedAsyncioTestCase):
             "Turn 1 started",
             "Turn 1 ended (interrupted: True)",  # First turn was interrupted
             "Turn 2 started",  # New turn started after interruption
-            "Turn 2 ended (interrupted: True)",  # Second turn ends due to EndFrame
         ]
         self.assertEqual(turn_events, expected_events)
+        self.assertEqual(turn_observer._turn_count, 2)
+        self.assertTrue(turn_observer._is_turn_active)
+
+    async def test_late_bot_stop_retains_interrupted_turn_owner(self):
+        """A physical bot stop after interruption remains associated with the old turn."""
+        turn_observer = TurnTrackingObserver(turn_end_timeout_secs=0.2)
+        processor = IdentityFilter()
+        bot_events = []
+
+        @turn_observer.event_handler("on_bot_started_speaking")
+        async def on_bot_started_speaking(observer, turn_number, data):
+            bot_events.append(("started", turn_number))
+
+        @turn_observer.event_handler("on_bot_stopped_speaking")
+        async def on_bot_stopped_speaking(observer, turn_number, data):
+            bot_events.append(("stopped", turn_number))
+
+        frames_to_send = [
+            UserStartedSpeakingFrame(),
+            UserStoppedSpeakingFrame(),
+            BotStartedSpeakingFrame(),
+            UserStartedSpeakingFrame(),
+            BotStoppedSpeakingFrame(),
+        ]
+
+        await run_test(
+            processor,
+            frames_to_send=frames_to_send,
+            expected_down_frames=[
+                UserStartedSpeakingFrame,
+                UserStoppedSpeakingFrame,
+                BotStartedSpeakingFrame,
+                UserStartedSpeakingFrame,
+                BotStoppedSpeakingFrame,
+            ],
+            observers=[turn_observer],
+        )
+
+        self.assertEqual(bot_events, [("started", 1), ("stopped", 1)])
         self.assertEqual(turn_observer._turn_count, 2)
 
     async def test_bot_starts_stops_multiple_times(self):
@@ -261,9 +430,9 @@ class TestTurnTrackingObserver(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(turn_events, expected_events)
         self.assertEqual(turn_observer._turn_count, 1)
 
-    async def test_cancel_frame_flushes_active_turn(self):
-        """Test that CancelFrame properly flushes an active turn."""
-        # Create observer with a long timeout to ensure CancelFrame is what ends the turn
+    async def test_cancel_frame_preserves_active_turn_for_downstream_tracing(self):
+        """CancelFrame must not end tracing before downstream processors finish."""
+        # Keep the turn active until cancellation reaches downstream processors.
         turn_observer = TurnTrackingObserver(turn_end_timeout_secs=5.0)
 
         # Create identity filter (passes all frames through)
@@ -304,13 +473,120 @@ class TestTurnTrackingObserver(unittest.IsolatedAsyncioTestCase):
             send_end_frame=False,  # Don't send EndFrame since we're testing CancelFrame
         )
 
-        # Verify that the turn was ended due to CancelFrame (marked as interrupted)
+        # The trace observer closes the active span during conversation cleanup.
         expected_events = [
             "Turn 1 started",
-            "Turn 1 ended (interrupted: True)",  # Should be interrupted due to CancelFrame
         ]
         self.assertEqual(turn_events, expected_events)
         self.assertEqual(turn_observer._turn_count, 1)
+        self.assertTrue(turn_observer._is_turn_active)
+        self.assertIsNone(turn_observer._end_turn_timer)
+
+    async def test_muted_user_speech_is_ignored(self):
+        """Speech detected while the user is muted must not advance turns or report speech.
+
+        Reproduces echo of the bot's own audio being detected as user speech
+        while a mute strategy has the user muted (e.g. during the bot's first
+        utterance on a telephony call with no echo cancellation).
+        """
+        turn_observer = TurnTrackingObserver(turn_end_timeout_secs=0.2)
+        processor = IdentityFilter()
+
+        turn_events = []
+        user_speech_events = []
+
+        @turn_observer.event_handler("on_turn_started")
+        async def on_turn_started(observer, turn_number):
+            turn_events.append(f"Turn {turn_number} started")
+
+        @turn_observer.event_handler("on_turn_ended")
+        async def on_turn_ended(observer, turn_number, duration, was_interrupted):
+            turn_events.append(f"Turn {turn_number} ended (interrupted: {was_interrupted})")
+
+        @turn_observer.event_handler("on_user_speech_started_for_turn")
+        async def on_user_speech_started_for_turn(observer, turn_number, data):
+            user_speech_events.append(("started", turn_number))
+
+        @turn_observer.event_handler("on_user_speech_stopped_for_turn")
+        async def on_user_speech_stopped_for_turn(observer, turn_number, data):
+            user_speech_events.append(("stopped", turn_number))
+
+        frames_to_send = [
+            # Turn 1: bot speaks its greeting with the user muted. Echo of the
+            # bot audio is detected as user speech and must be ignored — it
+            # must not interrupt turn 1 or record user speech timing.
+            BotStartedSpeakingFrame(),
+            UserMuteStartedFrame(),
+            UserStartedSpeakingFrame(),
+            UserStoppedSpeakingFrame(),
+            BotStoppedSpeakingFrame(),
+            UserMuteStoppedFrame(),
+            # Turn 2: the real user reply.
+            UserStartedSpeakingFrame(),
+            UserStoppedSpeakingFrame(),
+        ]
+
+        expected_down_frames = [
+            BotStartedSpeakingFrame,
+            UserMuteStartedFrame,
+            UserStartedSpeakingFrame,
+            UserStoppedSpeakingFrame,
+            BotStoppedSpeakingFrame,
+            UserMuteStoppedFrame,
+            UserStartedSpeakingFrame,
+            UserStoppedSpeakingFrame,
+        ]
+
+        await run_test(
+            processor,
+            frames_to_send=frames_to_send,
+            expected_down_frames=expected_down_frames,
+            observers=[turn_observer],
+        )
+
+        expected_events = [
+            "Turn 1 started",
+            "Turn 1 ended (interrupted: False)",
+            "Turn 2 started",
+        ]
+        self.assertEqual(turn_events, expected_events)
+        self.assertEqual(user_speech_events, [("started", 2), ("stopped", 2)])
+        self.assertEqual(turn_observer._turn_count, 2)
+
+    async def test_user_stop_after_mute_engages_is_still_reported(self):
+        """A stop for speech that started unmuted closes that speech even if mute engaged mid-turn."""
+        turn_observer = TurnTrackingObserver(turn_end_timeout_secs=0.2)
+        processor = IdentityFilter()
+        user_speech_events = []
+
+        @turn_observer.event_handler("on_user_speech_started_for_turn")
+        async def on_user_speech_started_for_turn(observer, turn_number, data):
+            user_speech_events.append(("started", turn_number))
+
+        @turn_observer.event_handler("on_user_speech_stopped_for_turn")
+        async def on_user_speech_stopped_for_turn(observer, turn_number, data):
+            user_speech_events.append(("stopped", turn_number))
+
+        frames_to_send = [
+            UserStartedSpeakingFrame(),
+            UserMuteStartedFrame(),
+            UserStoppedSpeakingFrame(),
+        ]
+
+        expected_down_frames = [
+            UserStartedSpeakingFrame,
+            UserMuteStartedFrame,
+            UserStoppedSpeakingFrame,
+        ]
+
+        await run_test(
+            processor,
+            frames_to_send=frames_to_send,
+            expected_down_frames=expected_down_frames,
+            observers=[turn_observer],
+        )
+
+        self.assertEqual(user_speech_events, [("started", 1), ("stopped", 1)])
 
     async def test_end_frame_with_no_active_turn(self):
         """Test that EndFrame doesn't cause issues when no turn is active."""

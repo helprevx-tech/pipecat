@@ -38,7 +38,6 @@ from pipecat.frames.frames import (
     FunctionCallInProgressFrame,
     FunctionCallResultFrame,
     FunctionCallsStartedFrame,
-    InputAudioRawFrame,
     InterimTranscriptionFrame,
     InterruptionFrame,
     LLMAssistantPushAggregationFrame,
@@ -93,6 +92,7 @@ from pipecat.processors.aggregators.llm_context_summarizer import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor, FrameProcessorSetup
 from pipecat.services.stt_latency import DEFAULT_TTFS_P99
+from pipecat.turns.empty_user_turn import EmptyUserTurnConfig
 from pipecat.turns.types import UserTurnSpeculation
 from pipecat.turns.user_idle_controller import UserIdleController
 from pipecat.turns.user_mute import BaseUserMuteStrategy
@@ -125,8 +125,6 @@ class LLMUserAggregatorParams:
     """Parameters for configuring LLM user aggregation behavior.
 
     Parameters:
-        correct_aggregation_callback: Optional ``str -> str`` hook applied to the
-            aggregated assistant text before it is added to the context.
         add_tool_change_messages: When True, on each ``LLMSetToolsFrame`` the
             aggregator computes the diff against the currently advertised tools
             and appends a developer-role message to the context describing
@@ -144,6 +142,8 @@ class LLMUserAggregatorParams:
             mic mid-speech). Set to 0 to disable. Defaults to 1.0.
         user_turn_strategies: User turn start and stop strategies.
         user_mute_strategies: List of user mute strategies.
+        should_interrupt: Optional synchronous policy allowing interruption at
+            turn start. Returning False preserves turn detection and transcripts.
         user_turn_stop_timeout: Time in seconds to wait before considering the
             user's turn finished.
         user_idle_timeout: Timeout in seconds for detecting user idle state.
@@ -151,6 +151,11 @@ class LLMUserAggregatorParams:
             has been idle (not speaking) for this duration. Set to 0 to disable
             idle detection.
         vad_analyzer: Voice Activity Detection analyzer instance.
+        empty_user_turn: How to respond to a user turn that ends with no
+            transcript. By default, the bot answers such a turn when it
+            interrupted the bot, and leaves it unanswered otherwise. ``None``
+            leaves every such turn unanswered. Ignored with a realtime LLM
+            service, which hears the user's audio directly.
         filter_incomplete_user_turns: When enabled, the LLM outputs a
             turn-completion marker at the start of each response: ● (complete),
             ◐ (incomplete short), or ○ (incomplete long). Incomplete
@@ -176,9 +181,11 @@ class LLMUserAggregatorParams:
     audio_idle_timeout: float = 1.0
     user_turn_strategies: UserTurnStrategies | None = None
     user_mute_strategies: list[BaseUserMuteStrategy] = field(default_factory=list)
+    should_interrupt: Callable[[], bool] | None = None
     user_turn_stop_timeout: float = 5.0
     user_idle_timeout: float = 0
     vad_analyzer: VADAnalyzer | None = None
+    empty_user_turn: EmptyUserTurnConfig | None = field(default_factory=EmptyUserTurnConfig)
     filter_incomplete_user_turns: bool = False
     user_turn_completion_config: UserTurnCompletionConfig | None = None
 
@@ -233,6 +240,8 @@ class LLMAssistantAggregatorParams:
             (LLM-specific) tools are ignored. When using
             ``LLMContextAggregatorPair``, prefer setting this via its
             ``add_tool_change_messages`` argument instead. Defaults to False.
+        correct_aggregation_callback: Optional callback to correct corrupted
+            TTS text before it's added to the conversation context.
         enable_context_summarization: Legacy field name.
 
             .. deprecated:: 1.2.0
@@ -254,9 +263,6 @@ class LLMAssistantAggregatorParams:
     # ``.. deprecated::`` directives in the class docstring above.
     enable_context_summarization: bool | None = None
     context_summarization_config: LLMContextSummarizationConfig | None = None
-    # Optional hook applied to the assistant turn text right before it is added
-    # to the context. Lets the application correct a corrupted aggregation
-    # (e.g. against the reference text it asked TTS to speak).
     correct_aggregation_callback: Callable[[str], str] | None = None
 
     def __post_init__(self):
@@ -702,6 +708,7 @@ class LLMUserAggregator(LLMContextAggregator):
                 user_turn_strategies,
                 are_user_provided_custom_strategies=self._params.user_turn_strategies is not None,
             )
+            self._disable_empty_user_turn_recovery()
 
         self._user_is_muted = False
         self._user_turn_start_timestamp = ""
@@ -727,6 +734,10 @@ class LLMUserAggregator(LLMContextAggregator):
         # surfaces the full turn transcript even when several
         # inferences fire before finalization.
         self._full_user_turn_aggregation: str | None = None
+
+        # Whether the current user turn interrupted the bot.
+        self._user_turn_interrupted_bot = False
+        self._consecutive_empty_user_turn_recoveries = 0
 
         self._user_turn_controller = UserTurnController(
             user_turn_strategies=user_turn_strategies,
@@ -772,6 +783,11 @@ class LLMUserAggregator(LLMContextAggregator):
             )
             self._vad_controller.add_event_handler("on_push_frame", self._on_push_frame)
             self._vad_controller.add_event_handler("on_broadcast_frame", self._on_broadcast_frame)
+
+    @property
+    def user_turn_controller(self) -> UserTurnController:
+        """The turn controller, including its runtime strategy update API."""
+        return self._user_turn_controller
 
     async def setup(self, setup: FrameProcessorSetup):
         """Set up the aggregator.
@@ -830,8 +846,6 @@ class LLMUserAggregator(LLMContextAggregator):
             await self.push_frame(frame, direction)
         elif isinstance(frame, TranscriptionFrame):
             await self._handle_transcription(frame)
-        elif isinstance(frame, NodeTransitionStartedFrame):
-            await self._handle_node_transition_started(frame)
         elif isinstance(
             frame,
             (
@@ -868,6 +882,12 @@ class LLMUserAggregator(LLMContextAggregator):
             await self.push_frame(frame, direction)
         elif isinstance(frame, LLMSetToolChoiceFrame):
             self.set_tool_choice(frame.tool_choice)
+        elif isinstance(frame, NodeTransitionStartedFrame):
+            await self.push_frame(frame, direction)
+            await self._handle_node_transition_started(frame)
+        elif isinstance(frame, FunctionCallsStartedFrame):
+            await self.push_frame(frame, direction)
+            await self._handle_function_calls_started(frame)
         elif isinstance(frame, ServiceMetadataFrame):
             await self._handle_service_metadata(frame)
             await self.push_frame(frame, direction)
@@ -893,12 +913,6 @@ class LLMUserAggregator(LLMContextAggregator):
     async def push_aggregation(self) -> str:
         """Push the current aggregation."""
         return await self._push_aggregation()
-
-    async def _handle_node_transition_started(self, frame: NodeTransitionStartedFrame):
-        """Commit without starting inference on the connection being replaced."""
-        await self._cancel_realtime_handoff_flush_task()
-        await self._push_aggregation(run_llm=False)
-        frame.context_aggregation_event.set()
 
     async def _push_aggregation(self, *, run_llm: bool = True) -> str:
         """Write the aggregated user turn to the context.
@@ -998,6 +1012,20 @@ class LLMUserAggregator(LLMContextAggregator):
             logger.warning(msg)
         else:
             logger.debug(msg)
+
+    def _disable_empty_user_turn_recovery(self):
+        """Turn off empty user turn recovery for realtime mode.
+
+        A realtime LLM service hears the user's audio directly, so an empty
+        transcript doesn't mean the model missed the speech.
+        """
+        if self._params.empty_user_turn is None:
+            return
+        self._params.empty_user_turn = None
+        logger.debug(
+            f"{self}: realtime mode — empty user turn recovery disabled; the realtime "
+            "LLM service hears the user's audio directly."
+        )
 
     async def _handle_service_metadata(self, frame: ServiceMetadataFrame):
         """Dispatch a service metadata frame.
@@ -1120,6 +1148,8 @@ class LLMUserAggregator(LLMContextAggregator):
             # Explicitly disabled — honor it silently; the user opted out.
             return
 
+        self._disable_empty_user_turn_recovery()
+
         strategies = self._user_turn_controller.user_turn_strategies
         self._apply_realtime_mode_strategy_mutations(
             strategies,
@@ -1210,7 +1240,6 @@ class LLMUserAggregator(LLMContextAggregator):
                 ProposedUserStoppedSpeakingFrame,
                 UserStartedSpeakingFrame,
                 UserStoppedSpeakingFrame,
-                InputAudioRawFrame,
                 InterimTranscriptionFrame,
                 TranscriptionFrame,
                 EagerTranscriptionFrame,
@@ -1255,6 +1284,31 @@ class LLMUserAggregator(LLMContextAggregator):
         self.transform_messages(frame.transform)
         if frame.run_llm:
             await self.push_context_frame()
+
+    async def _handle_function_calls_started(self, frame: FunctionCallsStartedFrame):
+        if not self._user_turn_controller.has_active_user_turn:
+            return
+
+        logger.info(f"{self}: Function call started while user turn is active, forcing stop.")
+
+        segment = self.aggregation_string()
+        if segment:
+            if self._full_user_turn_aggregation:
+                self._full_user_turn_aggregation = (
+                    f"{self._full_user_turn_aggregation} {segment}".strip()
+                )
+            else:
+                self._full_user_turn_aggregation = segment
+            await self.reset()
+
+        await self._user_turn_controller.force_user_turn_stop()
+
+    async def _handle_node_transition_started(self, frame: NodeTransitionStartedFrame):
+        """Commit pending user text before acknowledging a node handoff."""
+        if not frame.context_aggregation_event:
+            return
+        await self.push_aggregation()
+        frame.context_aggregation_event.set()
 
     async def _handle_transcription(self, frame: TranscriptionFrame):
         text = frame.text
@@ -1335,12 +1389,28 @@ class LLMUserAggregator(LLMContextAggregator):
         self._user_turn_start_timestamp = time_now_iso8601()
         self._full_user_turn_aggregation = None
 
+        interruptions_allowed = (
+            self._params.should_interrupt is None or self._params.should_interrupt()
+        )
+
+        # Unless the bot is waiting for the user, it's thinking, speaking or
+        # running a function call, and the interruption below cancels that.
+        self._user_turn_interrupted_bot = (
+            params.enable_interruptions
+            and interruptions_allowed
+            and not self._user_idle_controller.waiting_for_user
+        )
+
         if params.enable_user_speaking_frames:
-            await self.broadcast_frame(UserStartedSpeakingFrame)
+            await self.broadcast_frame(
+                UserStartedSpeakingFrame, enable_interruptions=interruptions_allowed
+            )
 
         await self._user_idle_controller.process_frame(UserStartedSpeakingFrame())
 
-        if params.enable_interruptions:
+        # A strategy may disable its own interruption because the provider
+        # already sent one. The frame carries policy, not that emission detail.
+        if params.enable_interruptions and interruptions_allowed:
             await self.broadcast_interruption()
 
         await self._call_event_handler("on_user_turn_started", strategy)
@@ -1490,6 +1560,52 @@ class LLMUserAggregator(LLMContextAggregator):
             )
             await self._call_event_handler("on_user_turn_stopped", strategy, message)
             self._user_turn_start_timestamp = ""
+
+        interrupted_bot = self._user_turn_interrupted_bot
+        self._user_turn_interrupted_bot = False
+
+        if content:
+            self._consecutive_empty_user_turn_recoveries = 0
+        elif not on_session_end:
+            # An empty turn doesn't run the LLM, so the bot stays silent unless
+            # a recovery runs it. Without one, restart the idle timer, which
+            # this turn's start cancelled.
+            if not await self._maybe_recover_empty_user_turn(interrupted_bot):
+                await self._user_idle_controller.wait_for_user()
+
+    async def _maybe_recover_empty_user_turn(self, interrupted_bot: bool) -> bool:
+        """Run the LLM for a user turn that ended with no transcript.
+
+        Args:
+            interrupted_bot: Whether the turn interrupted a response in progress.
+
+        Returns:
+            Whether the LLM was asked to respond.
+        """
+        config = self._params.empty_user_turn
+        if not config:
+            return False
+
+        prompt = config.interrupted_prompt if interrupted_bot else config.idle_prompt
+        if not prompt:
+            return False
+
+        if self._consecutive_empty_user_turn_recoveries >= config.max_consecutive_recoveries:
+            logger.debug(f"{self}: Empty user turn left unanswered (too many in a row)")
+            return False
+
+        # A pending function call result runs the LLM itself, and a muted user
+        # shouldn't be prompted to speak.
+        if self._user_is_muted or self._user_idle_controller.function_calls_in_progress:
+            return False
+
+        logger.debug(
+            f"{self}: Empty user turn ({'interrupted' if interrupted_bot else 'idle'}), running LLM"
+        )
+        self._consecutive_empty_user_turn_recoveries += 1
+        self._context.add_message(cast(LLMContextMessage, {"role": "developer", "content": prompt}))
+        await self.push_context_frame()
+        return True
 
 
 class LLMAssistantAggregator(LLMContextAggregator):
@@ -1796,11 +1912,15 @@ class LLMAssistantAggregator(LLMContextAggregator):
         aggregation = self.aggregation_string()
         await self.reset()
 
-        correct = self._params.correct_aggregation_callback
-        if correct is not None:
-            aggregation = correct(aggregation)
+        if aggregation:
+            if self._params.correct_aggregation_callback:
+                try:
+                    aggregation = self._params.correct_aggregation_callback(aggregation)
+                except Exception as e:
+                    logger.error(f"Error in aggregation correction callback: {e}")
 
-        self._context.add_message({"role": "assistant", "content": aggregation})
+            logger.debug(f"{self} push_aggregation called - self._aggregation = {aggregation}")
+            self._context.add_message({"role": "assistant", "content": aggregation})
 
         # Push context frame
         await self.push_context_frame()
@@ -2290,16 +2410,17 @@ class LLMAssistantAggregator(LLMContextAggregator):
         before the conversation moved on is indistinguishable from a synchronous
         one, and settles in place: its "started" placeholder becomes the tool
         result, and the LLM sees an ordinary call. The context alone decides.
-        The result is deferred when anything but protocol bookkeeping follows
-        the placeholder: a user message, assistant text, a developer message
-        such as new task instructions, or an intermediate update from this
-        call. Bookkeeping is other calls' placeholders and results, their
-        deferred messages, and assistant messages that carry only tool calls,
-        which a sibling in the same batch writes after this placeholder. A
-        model response that produced no text, or a later batch of tool calls
-        with none, is therefore invisible here. A placeholder that is no
-        longer in the context, because the context was rebuilt while the call
-        ran, also defers.
+        The result is deferred when a user or developer message follows the
+        placeholder: something the user said, new task instructions, or an
+        intermediate update from this call. Assistant messages are ignored,
+        so filler spoken with a ``TTSSpeakFrame`` while the call runs does
+        not defer it, whether the tool handler or an event handler spoke it.
+        The same holds for text the model wrote after seeing the placeholder
+        with no user turn in between, as when an ungrouped sibling's result
+        runs inference; the result still settles in place. Other calls'
+        placeholders, results, and deferred messages are ignored too. A
+        placeholder that is no longer in the context, because the context was
+        rebuilt while the call ran, also defers.
 
         Args:
             in_progress_frame: The call's in-progress frame.
@@ -2320,8 +2441,8 @@ class LLMAssistantAggregator(LLMContextAggregator):
                 )
                 continue
             role = message.get("role")
-            if role == "tool" or (role == "assistant" and not message.get("content")):
-                # A sibling's placeholder, result, or tool-call message.
+            if role in ("tool", "assistant"):
+                # A sibling's placeholder or result, or assistant output.
                 continue
             payload = async_tool_messages.parse_message(message)
             if payload is not None and payload.tool_call_id != tool_call_id:

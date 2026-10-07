@@ -53,9 +53,6 @@ GLADIA_TTFS_P99: float = 1.49
 GOOGLE_TTFS_P99: float = 1.57
 GRADIUM_TTFS_P99: float = 0.62
 GROQ_TTFS_P99: float = 1.54
-# Not benchmarked: HuggingFace inference endpoints vary by model and hardware,
-# so this is the conservative fallback. Measure with the STT benchmark tool and
-# pass ttfs_p99_latency to HuggingFaceSTTService for a real deployment.
 HUGGINGFACE_TTFS_P99: float = DEFAULT_TTFS_P99
 META_TTFS_P99: float = 1.92
 MISTRAL_TTFS_P99: float = 1.89
@@ -67,6 +64,7 @@ SARVAM_REALTIME_TTFS_P99: float = 1.00
 SMALLEST_TTFS_P99: float = 1.59
 SONIOX_TTFS_P99: float = 0.35
 SPEECHMATICS_TTFS_P99: float = 0.74
+DOGRAH_TTFS_P99: float = 0.35
 XAI_TTFS_P99: float = 2.14
 TOGETHER_TTFS_P99: float = 1.00
 

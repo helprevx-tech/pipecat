@@ -8,6 +8,8 @@
 
 import asyncio
 
+from loguru import logger
+
 from pipecat.frames.frames import (
     Frame,
     InterimTranscriptionFrame,
@@ -167,12 +169,17 @@ class UserTurnController(BaseObject):
     async def update_strategies(self, strategies: UserTurnStrategies):
         """Replace the current strategies with the given ones.
 
+        Retained strategy instances keep their state and running tasks. This
+        allows replacing start strategies while an active turn's stop detector
+        continues waiting for its transcript or timeout.
+
         Args:
             strategies: The new user turn strategies the controller should use.
         """
-        await self._cleanup_strategies()
+        previous = self._user_turn_strategies
+        await self._cleanup_strategies(exclude=[*strategies.start, *strategies.stop])
         self._user_turn_strategies = strategies
-        await self._setup_strategies()
+        await self._setup_strategies(exclude=[*previous.start, *previous.stop])
 
     @property
     def resolves_proposed_turn_start_frames(self) -> bool:
@@ -195,6 +202,34 @@ class UserTurnController(BaseObject):
         """
         return any(
             s.resolves_proposed_turn_stop_frames for s in self._user_turn_strategies.stop or []
+        )
+
+    @property
+    def has_active_user_turn(self) -> bool:
+        """Whether a user turn is currently active."""
+        return self._user_turn
+
+    async def force_user_turn_stop(self, *, enable_user_speaking_frames: bool = True):
+        """Force the current user turn to stop.
+
+        This is used when downstream semantic evidence, such as an LLM tool
+        call, proves the turn is complete before local stop strategies finish.
+
+        Args:
+            enable_user_speaking_frames: Whether the normal
+                ``UserStoppedSpeakingFrame`` should be emitted.
+        """
+        if not self._user_turn:
+            return
+
+        self._user_speaking = False
+        self._user_turn_stop_timeout_event.set()
+
+        # _trigger_user_turn_stop notifies every strategy (start strategies
+        # included) via handle_user_turn_stopped, so partially accumulated
+        # start-strategy state is cleared there.
+        await self._trigger_user_turn_stop(
+            None, UserTurnStoppedParams(enable_user_speaking_frames=enable_user_speaking_frames)
         )
 
     async def process_frame(self, frame: Frame):
@@ -229,11 +264,13 @@ class UserTurnController(BaseObject):
             if result == ProcessFrameResult.STOP:
                 break
 
-    async def _setup_strategies(self):
+    async def _setup_strategies(self, *, exclude=()):
         if not self._setup:
             raise RuntimeError(f"{self} was not properly set up")
 
         for s in self._user_turn_strategies.start or []:
+            if s in exclude:
+                continue
             await s.setup(self._setup)
             s.add_event_handler("on_push_frame", self._on_push_frame)
             s.add_event_handler("on_broadcast_frame", self._on_broadcast_frame)
@@ -241,6 +278,8 @@ class UserTurnController(BaseObject):
             s.add_event_handler("on_reset_aggregation", self._on_reset_aggregation)
 
         for s in self._user_turn_strategies.stop or []:
+            if s in exclude:
+                continue
             await s.setup(self._setup)
             s.add_event_handler("on_push_frame", self._on_push_frame)
             s.add_event_handler("on_broadcast_frame", self._on_broadcast_frame)
@@ -252,11 +291,13 @@ class UserTurnController(BaseObject):
             )
             s.add_event_handler("on_user_turn_stopped", self._on_user_turn_stopped)
 
-    async def _cleanup_strategies(self):
+    async def _cleanup_strategies(self, *, exclude=()):
         # Remove the handlers _setup_strategies added (symmetric), so re-applying
         # strategies via update_strategies — possibly reusing the same strategy
         # instances — doesn't accumulate duplicate handler registrations.
         for s in self._user_turn_strategies.start or []:
+            if s in exclude:
+                continue
             await s.cleanup()
             s.remove_event_handler("on_push_frame", self._on_push_frame)
             s.remove_event_handler("on_broadcast_frame", self._on_broadcast_frame)
@@ -264,6 +305,8 @@ class UserTurnController(BaseObject):
             s.remove_event_handler("on_reset_aggregation", self._on_reset_aggregation)
 
         for s in self._user_turn_strategies.stop or []:
+            if s in exclude:
+                continue
             await s.cleanup()
             s.remove_event_handler("on_push_frame", self._on_push_frame)
             s.remove_event_handler("on_broadcast_frame", self._on_broadcast_frame)
@@ -375,6 +418,13 @@ class UserTurnController(BaseObject):
         # Inference-triggered fires only while a turn is active. The turn
         # remains active afterward — only `on_user_turn_stopped` flips state.
         if not self._user_turn:
+            return
+
+        if self._user_speaking and speculation is None:
+            logger.debug(
+                f"{self}: User turn inference trigger ignored while user is speaking "
+                f"(strategy: {strategy})"
+            )
             return
 
         # Re-arm the stop watchdog so a stuck turn (inference fired but
