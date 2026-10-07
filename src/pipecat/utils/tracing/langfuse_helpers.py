@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-"""Helpers for Langfuse-oriented trace shaping in the Dograh Pipecat fork."""
+"""Helpers for Langfuse-oriented trace shaping in the HelpRevX (AayiqAgent) Pipecat fork."""
 
 from __future__ import annotations
 

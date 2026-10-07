@@ -2135,6 +2135,18 @@ class FrameProcessorResumeFrame(SystemFrame):
 
 
 @dataclass
+class NodeTransitionStartedFrame(ControlFrame, UninterruptibleFrame):
+    """Commit preceding user transcripts before a realtime node handoff.
+
+    Ordered with transcription frames; the user aggregator acknowledges the
+    context write before the service replaces its connection.
+    """
+
+    function_calls: Sequence[FunctionCallFromLLM]
+    context_aggregation_event: asyncio.Event
+
+
+@dataclass
 class LLMFullResponseStartFrame(ControlFrame):
     """Frame indicating the beginning of an LLM response.
 

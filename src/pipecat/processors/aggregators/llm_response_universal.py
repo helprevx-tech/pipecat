@@ -59,6 +59,7 @@ from pipecat.frames.frames import (
     LLMThoughtEndFrame,
     LLMThoughtStartFrame,
     LLMThoughtTextFrame,
+    NodeTransitionStartedFrame,
     ProposedUserStartedSpeakingFrame,
     ProposedUserStoppedSpeakingFrame,
     ServiceMetadataFrame,
@@ -829,6 +830,8 @@ class LLMUserAggregator(LLMContextAggregator):
             await self.push_frame(frame, direction)
         elif isinstance(frame, TranscriptionFrame):
             await self._handle_transcription(frame)
+        elif isinstance(frame, NodeTransitionStartedFrame):
+            await self._handle_node_transition_started(frame)
         elif isinstance(
             frame,
             (
@@ -890,6 +893,12 @@ class LLMUserAggregator(LLMContextAggregator):
     async def push_aggregation(self) -> str:
         """Push the current aggregation."""
         return await self._push_aggregation()
+
+    async def _handle_node_transition_started(self, frame: NodeTransitionStartedFrame):
+        """Commit without starting inference on the connection being replaced."""
+        await self._cancel_realtime_handoff_flush_task()
+        await self._push_aggregation(run_llm=False)
+        frame.context_aggregation_event.set()
 
     async def _push_aggregation(self, *, run_llm: bool = True) -> str:
         """Write the aggregated user turn to the context.

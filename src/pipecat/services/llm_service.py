@@ -52,6 +52,7 @@ from pipecat.frames.frames import (
     LLMServiceMetadataFrame,
     LLMTextFrame,
     LLMUpdateSettingsFrame,
+    NodeTransitionStartedFrame,
     StartFrame,
 )
 from pipecat.processors.aggregators.async_tool_messages import ASYNC_TOOL_INSTRUCTIONS
@@ -1491,6 +1492,10 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
             item = self._functions.get(None)
         return item is not None and not item.cancel_on_interruption
 
+    def _requires_node_transition_context_aggregation(self) -> bool:
+        """Whether reconnecting node transitions require a committed user turn."""
+        return False
+
     async def run_function_calls(self, function_calls: Sequence[FunctionCallFromLLM]):
         """Execute a sequence of function calls from the LLM.
 
@@ -1518,6 +1523,16 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
         user_visible_calls = [
             fc for fc in function_calls if fc.function_name not in self._cancel_tool_names
         ]
+        if self._requires_node_transition_context_aggregation() and any(
+            self._function_is_node_transition(fc.function_name) for fc in user_visible_calls
+        ):
+            committed = asyncio.Event()
+            await self.push_frame(
+                NodeTransitionStartedFrame(user_visible_calls, committed),
+                FrameDirection.UPSTREAM,
+            )
+            # Never reconnect with an uncommitted caller transcript.
+            await asyncio.wait_for(committed.wait(), timeout=5.0)
         if user_visible_calls:
             await self._call_event_handler("on_function_calls_started", user_visible_calls)
             await self.broadcast_frame(FunctionCallsStartedFrame, function_calls=user_visible_calls)
