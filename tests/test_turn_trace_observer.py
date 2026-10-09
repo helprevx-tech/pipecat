@@ -104,7 +104,10 @@ class TestTurnTraceObserver(unittest.IsolatedAsyncioTestCase):
 
     def _get_spans_by_name(self, name):
         """Return finished spans with the given name."""
-        return [s for s in self._exporter.get_finished_spans() if s.name == name]
+        spans = self._exporter.get_finished_spans()
+        if name == "turn":
+            return [s for s in spans if s.name.startswith("turn-")]
+        return [s for s in spans if s.name == name]
 
     async def test_conversation_span_created_on_start_frame(self):
         """Test that a conversation span is created when StartFrame is observed."""
@@ -183,6 +186,7 @@ class TestTurnTraceObserver(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(turn_spans), 2)
         turn_numbers = {s.attributes["turn.number"] for s in turn_spans}
         self.assertEqual(turn_numbers, {1, 2})
+        self.assertEqual({span.name for span in turn_spans}, {"turn-1", "turn-2"})
 
     async def test_turn_spans_are_children_of_conversation(self):
         """Test that turn spans are parented under the conversation span."""

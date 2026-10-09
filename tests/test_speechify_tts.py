@@ -9,6 +9,8 @@
 import pytest
 
 from pipecat.services.speechify.tts import (
+    SPEECHIFY_API_VERSION,
+    SpeechifyHttpTTSService,
     _output_format_from_sample_rate,
     _parse_sse_event,
     _SpeechMarkAccumulator,
@@ -197,11 +199,11 @@ class TestSSEParsing:
 
 
 class TestOutputFormat:
-    """Sample rates map to Speechify's PCM output formats."""
+    """Frame metadata reports the selected native PCM rate for transport resampling."""
 
     @pytest.mark.parametrize("sample_rate", [8000, 16000, 22050, 24000, 44100, 48000])
-    def test_supported_sample_rates_pass_through(self, sample_rate):
-        assert _output_format_from_sample_rate(sample_rate) == (f"pcm_{sample_rate}", sample_rate)
+    def test_transport_rates_keep_native_pcm_metadata(self, sample_rate):
+        assert _output_format_from_sample_rate(sample_rate) == ("pcm_24000", 24000)
 
     def test_unsupported_sample_rate_falls_back(self):
         """Speechify has no pcm_32000, so the caller is told the real synthesis rate."""
@@ -222,3 +224,8 @@ class TestLanguageMapping:
 
     def test_unmapped_languages_pass_through_as_bcp47_tags(self):
         assert language_to_speechify_language(Language.JA_JP) == "ja-JP"
+
+
+def test_timestamped_speech_requests_pin_api_version():
+    service = SpeechifyHttpTTSService(api_key="test-key", aiohttp_session=None)
+    assert service._headers["Speechify-Version"] == SPEECHIFY_API_VERSION == "2026-09-30"
