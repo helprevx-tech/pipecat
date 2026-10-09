@@ -15,15 +15,15 @@ session kinds build the client and the driver for their kind of scenario;
 
 Example::
 
-    scenario = load_scenario_file("scenarios/greeting.yaml")
     params = EvalSessionParams(stop_bot=True)
-    result = await EvalSession.from_scenario(scenario, "ws://localhost:7860", params=params).run()
-    print("PASS" if result.passed else "FAIL")
+    for scenario in EvalScenarioFile.load("scenarios/greeting.yaml"):
+        session = EvalSession.from_scenario(scenario, "ws://localhost:7860", params=params)
+        result = await session.run()
+        print(scenario.name, "PASS" if result.passed else "FAIL")
 """
 
 import time
 import traceback
-import warnings
 from abc import abstractmethod
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Generic, TypeVar, overload
@@ -39,6 +39,7 @@ from pipecat.evals.results import (
 )
 from pipecat.evals.scenario import EvalKind, EvalScriptScenario, EvalSimulationScenario
 from pipecat.utils.base_object import BaseObject
+from pipecat.utils.deprecation import warn_deprecated
 
 if TYPE_CHECKING:
     from pipecat.evals.base_driver import BaseEvalDriver
@@ -108,11 +109,10 @@ def _params_with_deprecated_knobs(
     params = params or EvalSessionParams()
     if not given:
         return params
-    names = ", ".join(f"`{name}`" for name in given)
-    warnings.warn(
-        f"{names} of `{caller}` {'is' if len(given) == 1 else 'are'} deprecated since 1.9.0 "
-        "and will be removed in 2.0.0. Use `params=EvalSessionParams(...)` instead.",
-        DeprecationWarning,
+    names = ", ".join(f"{name}=..." for name in given)
+    warn_deprecated(
+        f"`{caller}({names})` is deprecated since 1.9.0 and will be removed in 2.0.0. "
+        "Use `params=EvalSessionParams(...)` instead.",
         stacklevel=3,
     )
     return params.model_copy(update=given)
@@ -384,21 +384,28 @@ class EvalSession(BaseObject, Generic[R]):
         for line in self._describe().splitlines():
             self._trace.log(line)
 
-        skipped = self._skip_reason()
-        if skipped is not None:
-            logger.warning(f"Eval '{self._name}': {skipped}; skipping")
-            return self._result(started, [], skipped=skipped)
-
-        # A bot that never accepts is a clean <connect> failure.
+        # The judge is closed however the run ends, including the runs that are
+        # skipped or never reach the bot.
         try:
-            await self._client.wait_for_bot()
-        except (OSError, TimeoutError) as e:
-            reason = f"failed to connect to {self._bot_url}: {e.__class__.__name__}"
-            return self._result(started, [self._failure("<connect>", reason, "connect_failed")])
+            skipped = self._skip_reason()
+            if skipped is not None:
+                logger.warning(f"Eval '{self._name}': {skipped}; skipping")
+                return self._result(started, [], skipped=skipped)
 
-        failures = await self._drive()
-        self._trace.log(f"done: {'PASS' if not failures else 'FAIL'} ({len(failures)} failure(s))")
-        return self._result(started, failures)
+            # A bot that never accepts is a clean <connect> failure.
+            try:
+                await self._client.wait_for_bot()
+            except (OSError, TimeoutError) as e:
+                reason = f"failed to connect to {self._bot_url}: {e.__class__.__name__}"
+                return self._result(started, [self._failure("<connect>", reason, "connect_failed")])
+
+            failures = await self._drive()
+            self._trace.log(
+                f"done: {'PASS' if not failures else 'FAIL'} ({len(failures)} failure(s))"
+            )
+            return self._result(started, failures)
+        finally:
+            await self._driver.close()
 
     async def _drive(self) -> list[EvalAssertionFailure]:
         """Start the client, converse, and tear down.

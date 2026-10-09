@@ -8,12 +8,13 @@
 
 import inspect
 import time
-import warnings
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import (
     TYPE_CHECKING,
+    Any,
+    Literal,
     Optional,
     cast,
 )
@@ -27,8 +28,13 @@ from pipecat.frames.frames import (
     AggregatedTextFrame,
     AggregatedTextProgressFrame,
     AggregationType,
+    AudioRawFrame,
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
+    ExternalFunctionCallCancelFrame,
+    ExternalFunctionCallInProgressFrame,
+    ExternalFunctionCallResultFrame,
+    ExternalFunctionCallsStartedFrame,
     Frame,
     FunctionCallCancelFrame,
     FunctionCallInProgressFrame,
@@ -40,6 +46,7 @@ from pipecat.frames.frames import (
     LLMContextFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
+    LLMMarkerResponseFrame,
     LLMTextFrame,
     MetricsFrame,
     TranscriptionFrame,
@@ -74,6 +81,7 @@ from pipecat.processors.frameworks.rtvi.frames import (
 )
 from pipecat.processors.frameworks.rtvi.models import BotOutputTransformResult
 from pipecat.transports.base_output import BaseOutputTransport
+from pipecat.utils.deprecation import warn_deprecated
 from pipecat.utils.string import match_endofsentence
 
 if TYPE_CHECKING:
@@ -89,12 +97,14 @@ class RTVIFunctionCallReportLevel(StrEnum):
         DISABLED: No events emitted for this function call.
         NONE: Events only with tool_call_id, no function name or metadata (most secure).
         NAME: Events with function name, no arguments or results.
+        ARGUMENTS: Events with function name and arguments, no results.
         FULL: Events with function name, arguments, and results.
     """
 
     DISABLED = "disabled"
     NONE = "none"
     NAME = "name"
+    ARGUMENTS = "arguments"
     FULL = "full"
 
 
@@ -105,6 +115,11 @@ class RTVIObserverParams:
     Parameters:
         bot_output_enabled: Indicates if bot output messages should be sent.
         bot_llm_enabled: Indicates if the bot's LLM messages should be sent.
+        bot_llm_marker_enabled: Indicates if the bot's LLM marker reports
+            (``LLMMarkerResponseFrame``, e.g. from ``filter_incomplete_user_turns``)
+            should be sent. A report carries the marker the LLM emitted and the raw
+            text of the whole response, which is meant for evaluation, not for
+            clients, so this is off by default. Defaults to False.
         bot_tts_enabled: Indicates if the bot's TTS messages should be sent.
         bot_speaking_enabled: Indicates if the bot's started/stopped speaking messages should be sent.
         bot_audio_level_enabled: Indicates if bot's audio level messages should be sent.
@@ -159,6 +174,7 @@ class RTVIObserverParams:
                 - DISABLED: No events emitted for this function.
                 - NONE: Events with tool_call_id only (most secure when events needed).
                 - NAME: Adds function name to events.
+                - ARGUMENTS: Adds function name and arguments, no results.
                 - FULL: Adds function name, arguments, and results.
 
             Defaults to ``{"*": RTVIFunctionCallReportLevel.NONE}``.
@@ -166,6 +182,7 @@ class RTVIObserverParams:
 
     bot_output_enabled: bool = True
     bot_llm_enabled: bool = True
+    bot_llm_marker_enabled: bool = False
     bot_tts_enabled: bool = True
     bot_speaking_enabled: bool = True
     bot_audio_level_enabled: bool = False
@@ -225,7 +242,6 @@ class RTVIObserver(BaseObserver):
         self._params = params or RTVIObserverParams()
 
         self._ignored_sources: set[FrameProcessor] = set(self._params.ignored_sources)
-        self._frames_seen = set()
 
         self._bot_transcription = ""
         self._last_user_audio_level = 0
@@ -298,12 +314,11 @@ class RTVIObserver(BaseObserver):
         """
         is_progress_aware = self._check_progress_aware(transform_function)
         if not is_progress_aware:
-            warnings.warn(
-                f"Bot output transform '{transform_function.__name__}' uses the deprecated "
-                "2-parameter signature '(text, agg_type) -> str'. Update to the 4-parameter "
-                "signature '(text, agg_type, accumulated_text, remaining_text) -> "
-                "BotOutputTransformResult' to support word-level progress transforms.",
-                DeprecationWarning,
+            warn_deprecated(
+                f"`{transform_function.__name__}(text, agg_type) -> str` is deprecated since "
+                "1.4.0 and will be removed in 2.0.0. Use `(text, agg_type, accumulated_text, "
+                "remaining_text) -> BotOutputTransformResult` instead. It supports word-level "
+                "progress transforms.",
                 stacklevel=2,
             )
         self._aggregation_transforms.append(
@@ -384,6 +399,9 @@ class RTVIObserver(BaseObserver):
             logger.debug(
                 f"{self}: vad_user_speaking_enabled set to {frame.vad_user_speaking_enabled}"
             )
+        if frame.bot_llm_marker_enabled is not None:
+            self._params.bot_llm_marker_enabled = frame.bot_llm_marker_enabled
+            logger.debug(f"{self}: bot_llm_marker_enabled set to {frame.bot_llm_marker_enabled}")
 
     async def _logger_sink(self, message):
         """Logger sink so we can send system logs to RTVI clients."""
@@ -410,6 +428,99 @@ class RTVIObserver(BaseObserver):
         if self._rtvi:
             await self._rtvi.push_transport_message(model, exclude_none)
 
+    async def _report_function_call_frame(self, frame: Frame):
+        """Report a function-call frame, the pipeline's own or an external one."""
+        if isinstance(frame, FunctionCallsStartedFrame):
+            for function_call in frame.function_calls:
+                await self._report_function_call(
+                    "started", function_call.function_name, function_call.tool_call_id
+                )
+        elif isinstance(frame, FunctionCallInProgressFrame):
+            await self._report_function_call(
+                "in_progress", frame.function_name, frame.tool_call_id, arguments=frame.arguments
+            )
+        elif isinstance(frame, FunctionCallCancelFrame):
+            await self._report_function_call(
+                "stopped", frame.function_name, frame.tool_call_id, cancelled=True
+            )
+        elif isinstance(frame, FunctionCallResultFrame):
+            # An intermediate result leaves the call running.
+            if frame.properties is None or frame.properties.is_final:
+                await self._report_function_call(
+                    "stopped", frame.function_name, frame.tool_call_id, result=frame.result
+                )
+        elif isinstance(frame, ExternalFunctionCallsStartedFrame):
+            for call in frame.function_calls:
+                await self._report_function_call("started", call.function_name, call.tool_call_id)
+        elif isinstance(frame, ExternalFunctionCallInProgressFrame):
+            await self._report_function_call(
+                "in_progress", frame.function_name, frame.tool_call_id, arguments=frame.arguments
+            )
+        elif isinstance(frame, ExternalFunctionCallResultFrame):
+            if frame.is_final:
+                await self._report_function_call(
+                    "stopped", frame.function_name, frame.tool_call_id, result=frame.result
+                )
+        elif isinstance(frame, ExternalFunctionCallCancelFrame):
+            await self._report_function_call(
+                "stopped", frame.function_name, frame.tool_call_id, cancelled=True
+            )
+
+    async def _report_function_call(
+        self,
+        phase: Literal["started", "in_progress", "stopped"],
+        function_name: str,
+        tool_call_id: str,
+        *,
+        arguments: Mapping[str, Any] | None = None,
+        result: Any = None,
+        cancelled: bool = False,
+    ):
+        """Send the function-call message for a phase, as the report level allows.
+
+        The pipeline's own calls and calls reported from elsewhere (the
+        ``ExternalFunctionCall*Frame`` family) go through here alike, so both
+        obey the per-function report level.
+        """
+        report_level = self._get_function_call_report_level(function_name)
+        if report_level == RTVIFunctionCallReportLevel.DISABLED:
+            return
+        named = report_level in (
+            RTVIFunctionCallReportLevel.NAME,
+            RTVIFunctionCallReportLevel.ARGUMENTS,
+            RTVIFunctionCallReportLevel.FULL,
+        )
+        with_arguments = report_level in (
+            RTVIFunctionCallReportLevel.ARGUMENTS,
+            RTVIFunctionCallReportLevel.FULL,
+        )
+        full = report_level == RTVIFunctionCallReportLevel.FULL
+        message: BaseModel
+        if phase == "started":
+            message = RTVI.LLMFunctionCallStartMessage(
+                data=RTVI.LLMFunctionCallStartMessageData(
+                    function_name=function_name if named else None,
+                )
+            )
+        elif phase == "in_progress":
+            message = RTVI.LLMFunctionCallInProgressMessage(
+                data=RTVI.LLMFunctionCallInProgressMessageData(
+                    tool_call_id=tool_call_id,
+                    function_name=function_name if named else None,
+                    arguments=arguments if with_arguments else None,
+                )
+            )
+        else:
+            message = RTVI.LLMFunctionCallStoppedMessage(
+                data=RTVI.LLMFunctionCallStoppedMessageData(
+                    tool_call_id=tool_call_id,
+                    cancelled=cancelled,
+                    function_name=function_name if named else None,
+                    result=(result if result else None) if full and not cancelled else None,
+                )
+            )
+        await self.send_rtvi_message(message)
+
     async def on_push_frame(self, data: FramePushed):
         """Process a frame being pushed through the pipeline.
 
@@ -429,13 +540,20 @@ class RTVIObserver(BaseObserver):
         if frame.broadcast_sibling_id is not None and direction != FrameDirection.DOWNSTREAM:
             return
 
-        # If we have already seen this frame, let's skip it.
-        if frame.id in self._frames_seen:
+        # Audio frames are the bulk of what a pipeline pushes, and they are
+        # only handled when audio levels are reported.
+        if isinstance(frame, AudioRawFrame) and not (
+            self._params.user_audio_level_enabled or self._params.bot_audio_level_enabled
+        ):
             return
 
-        # This tells whether the frame is already processed. If false, we will try
-        # again the next time we see the frame.
-        mark_as_seen = True
+        # A frame is handled the first time it is pushed, except aggregated
+        # text, which is handled once it has gone through the output
+        # transport and has the right timing.
+        if not data.first_push and not isinstance(
+            frame, (AggregatedTextFrame, AggregatedTextProgressFrame)
+        ):
+            return
 
         if (
             isinstance(frame, (UserStartedSpeakingFrame, UserStoppedSpeakingFrame))
@@ -474,86 +592,45 @@ class RTVIObserver(BaseObserver):
             await self.send_rtvi_message(RTVI.BotLLMStoppedMessage())
         elif isinstance(frame, LLMTextFrame) and self._params.bot_llm_enabled:
             await self._handle_llm_text_frame(frame)
+        elif isinstance(frame, LLMMarkerResponseFrame) and self._params.bot_llm_marker_enabled:
+            await self.send_rtvi_message(
+                RTVI.BotLLMMarkerMessage(
+                    data=RTVI.BotLLMMarkerMessageData(
+                        text=frame.marker or "",
+                        kind=frame.kind,
+                        raw=frame.raw,
+                        markers=list(frame.markers),
+                    )
+                )
+            )
         elif isinstance(frame, TTSStartedFrame) and self._params.bot_tts_enabled:
             await self.send_rtvi_message(RTVI.BotTTSStartedMessage())
         elif isinstance(frame, TTSStoppedFrame) and self._params.bot_tts_enabled:
             await self.send_rtvi_message(RTVI.BotTTSStoppedMessage())
         elif isinstance(frame, AggregatedTextProgressFrame):
-            if not isinstance(src, BaseOutputTransport):
-                # This check is to make sure we handle the frame when it has gone
-                # through the transport and has correct timing.
-                mark_as_seen = False
-            else:
+            if isinstance(src, BaseOutputTransport):
                 await self._handle_aggregated_progress(frame)
         elif isinstance(frame, AggregatedTextFrame) and (
             self._params.bot_output_enabled or self._params.bot_tts_enabled
         ):
-            if not isinstance(src, BaseOutputTransport):
-                # This check is to make sure we handle the frame when it has gone
-                # through the transport and has correct timing.
-                mark_as_seen = False
-            else:
+            if isinstance(src, BaseOutputTransport):
                 await self._handle_aggregated_llm_text(frame)
         elif isinstance(frame, MetricsFrame) and self._params.metrics_enabled:
             await self._handle_metrics(frame)
-        elif isinstance(frame, FunctionCallsStartedFrame):
-            for function_call in frame.function_calls:
-                report_level = self._get_function_call_report_level(function_call.function_name)
-                if report_level == RTVIFunctionCallReportLevel.DISABLED:
-                    continue
-                msg_data = RTVI.LLMFunctionCallStartMessageData()
-                if report_level in (
-                    RTVIFunctionCallReportLevel.NAME,
-                    RTVIFunctionCallReportLevel.FULL,
-                ):
-                    msg_data.function_name = function_call.function_name
-                message = RTVI.LLMFunctionCallStartMessage(data=msg_data)
-                await self.send_rtvi_message(message)
-        elif isinstance(frame, FunctionCallInProgressFrame):
-            report_level = self._get_function_call_report_level(frame.function_name)
-            if report_level != RTVIFunctionCallReportLevel.DISABLED:
-                msg_data = RTVI.LLMFunctionCallInProgressMessageData(
-                    tool_call_id=frame.tool_call_id
-                )
-                if report_level in (
-                    RTVIFunctionCallReportLevel.NAME,
-                    RTVIFunctionCallReportLevel.FULL,
-                ):
-                    msg_data.function_name = frame.function_name
-                if report_level == RTVIFunctionCallReportLevel.FULL:
-                    msg_data.arguments = frame.arguments
-                message = RTVI.LLMFunctionCallInProgressMessage(data=msg_data)
-                await self.send_rtvi_message(message)
-        elif isinstance(frame, FunctionCallCancelFrame):
-            report_level = self._get_function_call_report_level(frame.function_name)
-            if report_level != RTVIFunctionCallReportLevel.DISABLED:
-                msg_data = RTVI.LLMFunctionCallStoppedMessageData(
-                    tool_call_id=frame.tool_call_id,
-                    cancelled=True,
-                )
-                if report_level in (
-                    RTVIFunctionCallReportLevel.NAME,
-                    RTVIFunctionCallReportLevel.FULL,
-                ):
-                    msg_data.function_name = frame.function_name
-                message = RTVI.LLMFunctionCallStoppedMessage(data=msg_data)
-                await self.send_rtvi_message(message)
-        elif isinstance(frame, FunctionCallResultFrame):
-            report_level = self._get_function_call_report_level(frame.function_name)
-            if report_level != RTVIFunctionCallReportLevel.DISABLED:
-                msg_data = RTVI.LLMFunctionCallStoppedMessageData(
-                    tool_call_id=frame.tool_call_id,
-                    cancelled=False,
-                )
-                if report_level in (
-                    RTVIFunctionCallReportLevel.NAME,
-                    RTVIFunctionCallReportLevel.FULL,
-                ):
-                    msg_data.function_name = frame.function_name
-                if report_level == RTVIFunctionCallReportLevel.FULL:
-                    msg_data.result = frame.result if frame.result else None
-                message = RTVI.LLMFunctionCallStoppedMessage(data=msg_data)
-                await self.send_rtvi_message(message)
+        elif isinstance(
+            frame,
+            (
+                FunctionCallsStartedFrame,
+                FunctionCallInProgressFrame,
+                FunctionCallCancelFrame,
+                FunctionCallResultFrame,
+                ExternalFunctionCallsStartedFrame,
+                ExternalFunctionCallInProgressFrame,
+                ExternalFunctionCallCancelFrame,
+                ExternalFunctionCallResultFrame,
+            ),
+        ):
+            await self._report_function_call_frame(frame)
         elif isinstance(frame, RTVIServerMessageFrame):
             message = RTVI.ServerMessage(data=frame.data)
             await self.send_rtvi_message(message)
@@ -593,9 +670,6 @@ class RTVIObserver(BaseObserver):
                 message = RTVI.BotAudioLevelMessage(data=RTVI.AudioLevelMessageData(value=level))
                 await self.send_rtvi_message(message)
                 self._last_bot_audio_level = curr_time
-
-        if mark_as_seen:
-            self._frames_seen.add(frame.id)
 
     async def _handle_interruptions(self, frame: Frame):
         """Handle user speaking interruption frames."""

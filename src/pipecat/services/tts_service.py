@@ -8,9 +8,8 @@
 
 import asyncio
 import uuid
-import warnings
 from abc import abstractmethod
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import (
@@ -52,12 +51,17 @@ from pipecat.services.settings import TTSSettings
 from pipecat.services.websocket_service import WebsocketService
 from pipecat.transcriptions.language import Language
 from pipecat.utils.context.aggregated_frame_sequencer import AggregatedFrameSequencer
-from pipecat.utils.deprecation import deprecated
+from pipecat.utils.deprecation import deprecated, warn_deprecated
 from pipecat.utils.errors import ErrorCategory
 from pipecat.utils.frame_queue import FrameQueue
+from pipecat.utils.string import resolve_sentence_tokenizer_language
 from pipecat.utils.text.base_text_filter import BaseTextFilter
 from pipecat.utils.text.pattern_pair_aggregator import PatternMatch
 from pipecat.utils.text.simple_text_aggregator import SimpleTextAggregator
+from pipecat.utils.text.transforms.pronunciations import (
+    PronunciationTransform,
+    pronunciation_transform,
+)
 from pipecat.utils.text.word_timestamp_utils import merge_punct_tokens
 from pipecat.utils.time import seconds_to_nanoseconds
 from pipecat.utils.types import is_given
@@ -105,6 +109,15 @@ class _WordTimestampEntry:
     timestamp: float
     context_id: str
     includes_inter_frame_spaces: bool = False
+
+
+@dataclass
+class _AudioRemainder:
+    """Internal: the bytes of a sample split across audio chunks, with their format."""
+
+    audio: bytes
+    sample_rate: int
+    num_channels: int
 
 
 class TTSService(AIService):
@@ -257,6 +270,10 @@ class TTSService(AIService):
             **kwargs,
         )
 
+        aggregation_language = resolve_sentence_tokenizer_language(
+            self._settings.language if is_given(self._settings.language) else None
+        )
+
         # Convert Language enum to service-specific format at init time.
         # Runtime updates are handled by _update_settings(), but init-time
         # settings bypass that path and need explicit conversion.
@@ -279,15 +296,12 @@ class TTSService(AIService):
 
         # Resolve text_aggregation_mode from the new param or deprecated aggregate_sentences
         if aggregate_sentences is not None:
-            with warnings.catch_warnings():
-                warnings.simplefilter("always")
-                warnings.warn(
-                    "Parameter 'aggregate_sentences' is deprecated. "
-                    "Use 'text_aggregation_mode=TextAggregationMode.SENTENCE' or "
-                    "'text_aggregation_mode=TextAggregationMode.TOKEN' instead.",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
+            warn_deprecated(
+                "`aggregate_sentences` is deprecated since 0.0.104 and will be removed in "
+                "2.0.0. Use `text_aggregation_mode=TextAggregationMode.SENTENCE` or "
+                "`text_aggregation_mode=TextAggregationMode.TOKEN` instead.",
+                stacklevel=2,
+            )
             if text_aggregation_mode is None:
                 text_aggregation_mode = (
                     TextAggregationMode.SENTENCE
@@ -307,16 +321,13 @@ class TTSService(AIService):
         self._silence_time_s: float = silence_time_s
         self._pause_frame_processing: bool = pause_frame_processing
         if pause_watchdog_timeout_s is not None:
-            with warnings.catch_warnings():
-                warnings.simplefilter("always")
-                warnings.warn(
-                    "`pause_watchdog_timeout_s` is deprecated since 1.8.0 and will be "
-                    "removed in 2.0.0. No replacement. Frame processing is paused only "
-                    "while there is audio still to be played, so the pause cannot "
-                    "outlive what it waits for.",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
+            warn_deprecated(
+                "`pause_watchdog_timeout_s` is deprecated since 1.8.0 and will be "
+                "removed in 2.0.0. No replacement. Frame processing is paused only "
+                "while there is audio still to be played, so the pause cannot "
+                "outlive what it waits for.",
+                stacklevel=2,
+            )
         # Whether the bot is currently speaking. Set on BotStartedSpeakingFrame,
         # cleared on BotStoppedSpeakingFrame and InterruptionFrame. Used by
         # InterruptibleTTSService to decide whether an interruption needs a
@@ -327,12 +338,18 @@ class TTSService(AIService):
         self._append_trailing_space: bool = append_trailing_space
         self._init_sample_rate = sample_rate
         self._sample_rate = 0
-        self._text_aggregator = SimpleTextAggregator(aggregation_type=self._text_aggregation_mode)
+        self._text_aggregator = SimpleTextAggregator(
+            aggregation_type=self._text_aggregation_mode,
+            language=aggregation_language,
+        )
 
         self._skip_aggregator_types: list[str] = skip_aggregator_types or []
         self._text_transforms: list[
             tuple[AggregationType | str, Callable[[str, AggregationType | str], Awaitable[str]]]
         ] = text_transforms or []
+        # Whether pronunciation transforms are being skipped, so the warning is
+        # logged once each time they start being skipped, not for every sentence.
+        self._skipping_pronunciations = False
         # TODO: Deprecate _text_filters when added to LLMTextProcessor
         self._text_filters: Sequence[BaseTextFilter] = text_filters or []
         self._transport_destination: str | None = transport_destination
@@ -392,6 +409,9 @@ class TTSService(AIService):
         self._playing_context_id: str | None = None
         self._turn_context_id: str | None = None
         self._audio_contexts: dict[str, asyncio.Queue] = {}
+        # Trailing bytes of a sample split across audio chunks, per context. See
+        # _align_audio_frame.
+        self._audio_remainders: dict[str, _AudioRemainder] = {}
         self._audio_context_task: asyncio.Task | None = None
 
         # Single FIFO queue that serializes everything the TTS service emits downstream.
@@ -402,7 +422,7 @@ class TTSService(AIService):
         #           must be emitted in-order relative to surrounding audio contexts.
         #   None  – shutdown sentinel (sent by stop()).
         # Created once here so it survives interruptions: on interruption we call reset()
-        # which drops non-UninterruptibleFrame items while keeping uninterruptible ones
+        # which drops interruptible items while keeping uninterruptible ones
         # (e.g. FunctionCallResultFrame) that must not be lost mid-flight.
         self._serialization_queue: FrameQueue = FrameQueue(
             frame_getter=lambda item: item if isinstance(item, Frame) else None
@@ -594,6 +614,11 @@ class TTSService(AIService):
         """
         pass
 
+    @property
+    def text_aggregation_language(self) -> str:
+        """Current sentence tokenizer language, derived from TTS settings."""
+        return self._text_aggregator.language
+
     async def setup(self, setup: FrameProcessorSetup):
         """Set up the service.
 
@@ -674,6 +699,87 @@ class TTSService(AIService):
             if not (agg_type == aggregation_type and func == transform_function)
         ]
 
+    @classmethod
+    def format_pronunciation(cls, word: str, ipa: str) -> str | None:
+        """Render a word's pronunciation in this service's markup.
+
+        Services that support pronunciation hints override this. The base
+        implementation supports none.
+
+        Args:
+            word: The word as it appears in the text.
+            ipa: How to pronounce it, in IPA.
+
+        Returns:
+            The text to send in place of ``word``, or None when this service cannot
+            use the pronunciation.
+        """
+        return None
+
+    @property
+    def supports_pronunciations(self) -> bool:
+        """Whether this service reads pronunciation markup with its current settings.
+
+        Pronunciation transforms are skipped while this is False, so their words
+        are spoken as written. Services whose markup depends on the model or on a
+        setting override this; it is checked for every text sent, so it follows
+        settings updates.
+
+        Returns:
+            True in the base implementation.
+        """
+        return True
+
+    @classmethod
+    def pronunciation_transform_ipa(
+        cls, pronunciations: Mapping[str, str]
+    ) -> PronunciationTransform:
+        """Create a text transform that makes this service say words as IPA describes.
+
+        Each word is replaced with :meth:`format_pronunciation` output, so the
+        same IPA works with any service that supports it. Words the service
+        cannot use are reported once and spoken as written. While the service
+        cannot read pronunciation markup at all (see
+        :attr:`supports_pronunciations`), the transform is skipped.
+
+        Register this transform last in ``text_transforms``. Transforms run in
+        order, and one that runs after it (stripping markdown or symbols,
+        replacing text) can rewrite the markup it inserts, such as Cartesia's
+        ``<<…>>`` blocks or an SSML ``<phoneme>`` tag, and break the hint.
+
+        Args:
+            pronunciations: Word to IPA, e.g. ``{"Metformin": "mɛtˈfɔɹmɪn"}``.
+
+        Returns:
+            A transform to register with ``text_transforms``.
+
+        Example::
+
+            pronounce = CartesiaTTSService.pronunciation_transform_ipa(
+                {"Metformin": "mɛtˈfɔɹmɪn"}
+            )
+            tts = CartesiaTTSService(
+                text_transforms=[
+                    ("*", strip_markdown),
+                    ("*", expand_currency),
+                    ("*", pronounce),  # last, so nothing rewrites its markup
+                ],
+            )
+        """
+        return pronunciation_transform(
+            pronunciations, cls.format_pronunciation, service_name=cls.__name__
+        )
+
+    def _can_apply_pronunciations(self) -> bool:
+        supported = self.supports_pronunciations
+        if not supported and not self._skipping_pronunciations:
+            logger.warning(
+                f"{self} does not read pronunciation markup with its current settings "
+                f"(model {self._settings.model}), so pronunciation hints are spoken as written"
+            )
+        self._skipping_pronunciations = not supported
+        return supported
+
     async def _update_settings(self, delta: TTSSettings) -> dict[str, Any]:
         """Apply a TTS settings delta.
 
@@ -685,6 +791,7 @@ class TTSService(AIService):
         Returns:
             Dict mapping changed field names to their previous values.
         """
+        language = delta.language
         # Translate language *before* applying so the stored value is canonical.
         # Raw strings are first converted to Language enums for proper resolution.
         if (
@@ -705,6 +812,9 @@ class TTSService(AIService):
                 delta.language = converted
 
         changed = await super()._update_settings(delta)
+
+        if is_given(language):
+            self._text_aggregator.set_language(language)
 
         return changed
 
@@ -884,14 +994,12 @@ class TTSService(AIService):
                 await self._update_settings(frame.delta)
             elif frame.settings:
                 # Backward-compatible path: convert legacy dict to settings object.
-                with warnings.catch_warnings():
-                    warnings.simplefilter("always")
-                    warnings.warn(
-                        "Passing a dict via TTSUpdateSettingsFrame(settings={...}) is deprecated "
-                        "since 0.0.104, use TTSUpdateSettingsFrame(delta=TTSSettings(...)) instead.",
-                        DeprecationWarning,
-                        stacklevel=2,
-                    )
+                warn_deprecated(
+                    "`TTSUpdateSettingsFrame(settings={...})` is deprecated since 0.0.104 and "
+                    "will be removed in 2.0.0. Use "
+                    "`TTSUpdateSettingsFrame(delta=TTSSettings(...))` instead.",
+                    stacklevel=2,
+                )
                 delta = type(self._settings).from_mapping(frame.settings)
                 await self._update_settings(delta)
         elif isinstance(frame, BotStartedSpeakingFrame):
@@ -1028,7 +1136,7 @@ class TTSService(AIService):
             if len(buffer) % 2 == 1:
                 buffer.extend(b"\x00")
             audio = await maybe_resample(bytes(buffer))
-            yield TTSAudioRawFrame(audio, self.sample_rate, 1)
+            yield TTSAudioRawFrame(audio, self.sample_rate, 1, context_id=context_id)
 
     async def _handle_interruption(self, frame: InterruptionFrame, direction: FrameDirection):
         self._processing_text = False
@@ -1046,24 +1154,28 @@ class TTSService(AIService):
         await self.reset_word_timestamps()
 
         await self._stop_audio_context_task()
-        # Drops non-UninterruptibleFrame items while keeping uninterruptible ones
+        # Drops interruptible items while keeping uninterruptible ones
         # (e.g. FunctionCallResultFrame) that must not be lost mid-flight.
         self._serialization_queue.reset()
         audio_contexts = self.get_audio_contexts()
         if audio_contexts:
             for ctx_id in audio_contexts:
-                await self.on_audio_context_interrupted(context_id=ctx_id)
+                # A failing hook must not skip restarting the audio context task below.
+                try:
+                    await self.on_audio_context_interrupted(context_id=ctx_id)
+                except Exception as e:
+                    logger.warning(f"{self} on_audio_context_interrupted failed for {ctx_id}: {e}")
         self.reset_active_audio_context()
         self._turn_context_id = None
         self._word_last_pts = 0
         self._create_audio_context_task()
         # When pause_frame_processing=True, the process task may be blocked at
         # __process_event.wait() because pause_processing_frames() was called
-        # after LLMFullResponseEndFrame and an UninterruptibleFrame was dequeued
+        # after LLMFullResponseEndFrame and an uninterruptible frame was dequeued
         # before the interrupt arrived. _start_interruption() in the base class
-        # handles the common case (non-uninterruptible frames) by cancelling and
-        # recreating the process task. But when _start_interruption() detects an
-        # UninterruptibleFrame it only resets the queue, leaving the process task
+        # handles the common case (interruptible frames) by cancelling and
+        # recreating the process task. But when _start_interruption() finds an
+        # uninterruptible frame it only resets the queue, leaving the process task
         # blocked. BotStoppedSpeakingFrame never arrives (no audio played), so we
         # must resume here to prevent a permanent deadlock.
         await self._maybe_resume_frame_processing()
@@ -1250,6 +1362,10 @@ class TTSService(AIService):
         transformed_text = text
         for aggregation_type, transform in self._text_transforms:
             if aggregation_type == type or aggregation_type == "*":
+                if isinstance(transform, PronunciationTransform) and not (
+                    self._can_apply_pronunciations()
+                ):
+                    continue
                 try:
                     transformed_text = await transform(transformed_text, type)
                 except Exception as e:
@@ -1297,6 +1413,7 @@ class TTSService(AIService):
                 prepared_text,
                 append_to_context=self._tts_contexts[context_id].append_to_context,
                 build_tracker=not self._push_text_frames,
+                language=self.text_aggregation_language,
             ),
             context_id,
         )
@@ -1525,19 +1642,69 @@ class TTSService(AIService):
         if not context_id:
             logger.debug(f"{self} unable to append audio to context: no context ID provided")
             return
-        if self.audio_context_available(context_id):
-            logger.trace(f"{self} appending audio {frame} to audio context {context_id}")
-            await self._audio_contexts[context_id].put(frame)
-        # In case the frame is None, we should not recreate the context.
-        elif context_id == self._turn_context_id and frame:
-            # Sometimes the HTTP service can take more than 3 seconds without sending any audio
-            # So we are now recreating the context id while we are in the same turn
-            logger.debug(f"{self} recreating audio context {context_id}")
-            await self.create_audio_context(context_id)
-            logger.trace(f"{self} appending audio {frame} to audio context {context_id}")
-            await self._audio_contexts[context_id].put(frame)
-        else:
-            logger.debug(f"{self} unable to append audio to context {context_id}")
+        if not self.audio_context_available(context_id):
+            # In case the frame is None, we should not recreate the context.
+            if context_id == self._turn_context_id and frame:
+                # Sometimes the HTTP service can take more than 3 seconds without sending any audio
+                # So we are now recreating the context id while we are in the same turn
+                logger.debug(f"{self} recreating audio context {context_id}")
+                await self.create_audio_context(context_id)
+            else:
+                logger.debug(f"{self} unable to append audio to context {context_id}")
+                return
+        if isinstance(frame, TTSAudioRawFrame) and not self._align_audio_frame(context_id, frame):
+            return
+        # The context's audio ends here, so a held-back partial sample must be
+        # queued before the stop frame (or the end marker) that follows it.
+        if frame is None or isinstance(frame, TTSStoppedFrame):
+            await self._flush_audio_remainder(context_id)
+        logger.trace(f"{self} appending audio {frame} to audio context {context_id}")
+        await self._audio_contexts[context_id].put(frame)
+
+    def _align_audio_frame(self, context_id: str, frame: TTSAudioRawFrame) -> bool:
+        """Trim an audio frame to whole samples, carrying a split sample forward.
+
+        Providers may cut their PCM stream at any byte, so a chunk can end
+        mid-sample. The partial sample is held back and prepended to the
+        context's next frame, keeping every queued frame sample-aligned for
+        consumers that read audio frame by frame (metrics, resamplers, filters).
+        Frames that are already aligned pass through untouched.
+
+        Args:
+            context_id: The audio context the frame belongs to.
+            frame: The audio frame to align; its audio is replaced in place.
+
+        Returns:
+            False if the frame holds less than one whole sample and should be
+            dropped, True otherwise.
+        """
+        block_size = 2 * max(frame.num_channels, 1)
+        remainder = self._audio_remainders.pop(context_id, None)
+        if not remainder and len(frame.audio) % block_size == 0:
+            return True
+        audio = (remainder.audio if remainder else b"") + frame.audio
+        aligned_length = len(audio) - len(audio) % block_size
+        if aligned_length < len(audio):
+            self._audio_remainders[context_id] = _AudioRemainder(
+                audio[aligned_length:], frame.sample_rate, frame.num_channels
+            )
+        if not aligned_length:
+            return False
+        frame.audio = audio[:aligned_length]
+        frame.num_frames = aligned_length // block_size
+        return True
+
+    async def _flush_audio_remainder(self, context_id: str):
+        """Queue a context's held-back partial sample, zero-padded to a whole one."""
+        remainder = self._audio_remainders.pop(context_id, None)
+        if not remainder:
+            return
+        block_size = 2 * max(remainder.num_channels, 1)
+        audio = remainder.audio.ljust(block_size, b"\x00")
+        frame = TTSAudioRawFrame(
+            audio, remainder.sample_rate, remainder.num_channels, context_id=context_id
+        )
+        await self._audio_contexts[context_id].put(frame)
 
     async def remove_audio_context(self, context_id: str | None):
         """Remove an existing audio context.
@@ -1617,6 +1784,7 @@ class TTSService(AIService):
     def _create_audio_context_task(self):
         if not self._audio_context_task:
             self._audio_contexts: dict[str, asyncio.Queue] = {}
+            self._audio_remainders = {}
             self._audio_context_task = self.create_task(self._audio_context_task_handler())
 
     async def _stop_audio_context_task(self):
@@ -1651,7 +1819,16 @@ class TTSService(AIService):
 
                 # We just finished processing the context, so we can safely remove it.
                 del self._audio_contexts[context_id]
-                await self.on_audio_context_completed(context_id=context_id)
+                # If audio resumes after a timeout, the context is recreated
+                # without the partial sample held here.
+                self._audio_remainders.pop(context_id, None)
+                # A failing hook must not end this task, or no more audio is played.
+                try:
+                    await self.on_audio_context_completed(context_id=context_id)
+                except Exception as e:
+                    logger.warning(
+                        f"{self} on_audio_context_completed failed for {context_id}: {e}"
+                    )
                 self.reset_active_audio_context()
             else:
                 running = False
@@ -1970,6 +2147,33 @@ class WebsocketTTSService(TTSService, WebsocketService):
         """Release websocket TTS resources at teardown."""
         await super().cleanup()
         await self._disconnect()
+
+    async def _close_connection_contexts(self):
+        """End the audio contexts of a connection that is being replaced.
+
+        Providers keep context state per connection and don't resume it on a
+        new one, so audio still due on the old connection never arrives. Every
+        open context is closed (audio already received still plays), and a turn
+        in progress moves to a new context ID so its remaining sentences open a
+        fresh provider context. Reopening a connection that was already closed,
+        to send the text at hand, doesn't come through here, so the context it
+        sends to stays open.
+        """
+        for context_id in self.get_audio_contexts():
+            await self.remove_audio_context(context_id)
+        if self._turn_context_id:
+            self._turn_context_id = None
+            self._turn_context_id = self.create_context_id()
+
+    async def _disconnect(self):
+        # Subclasses call super()._disconnect() first, so this runs before they
+        # close their socket.
+        await self._close_connection_contexts()
+        await super()._disconnect()
+
+    async def _reconnect_websocket(self, attempt_number: int) -> bool:
+        await self._close_connection_contexts()
+        return await super()._reconnect_websocket(attempt_number)
 
     async def _report_error(self, error: ErrorFrame, force_treat_as_permanent: bool = False):
         await self._call_event_handler("on_connection_error", error.error)

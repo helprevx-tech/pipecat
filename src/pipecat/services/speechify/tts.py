@@ -42,6 +42,9 @@ CALLER_HEADERS = {
     "Speechify-Caller-Version": pipecat_version(),
 }
 
+# Pin the wire contract independently of the workspace default.
+SPEECHIFY_API_VERSION = "2026-09-30"
+
 SPEECHIFY_DEFAULT_SAMPLE_RATE = 24000
 
 
@@ -263,10 +266,13 @@ class SpeechifyHttpTTSService(TTSService):
     """Speechify HTTP-based TTS service with word timestamps.
 
     Streams PCM audio and word-level speech marks over Server-Sent Events from
-    Speechify's ``/v1/audio/stream/with-timestamps`` endpoint. Speech marks are only
-    produced by the streaming-native models, ``simba-3.2`` (English) and ``simba-3.0``
-    (multilingual); the legacy ``simba-english`` and ``simba-multilingual`` models are
-    rejected by this endpoint.
+    Speechify's ``/v1/audio/stream/with-timestamps`` endpoint, using the streaming-native
+    models ``simba-3.2`` (English) and ``simba-3.0`` (multilingual).
+
+    Requests pin Speechify's API version to :data:`SPEECHIFY_API_VERSION` rather than
+    letting the workspace default decide it. The legacy ``simba-english`` and
+    ``simba-multilingual`` models are retired at that version and return a
+    ``model_retired`` error.
     """
 
     Settings = SpeechifyTTSSettings
@@ -319,6 +325,7 @@ class SpeechifyHttpTTSService(TTSService):
         self._headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            "Speechify-Version": SPEECHIFY_API_VERSION,
             **CALLER_HEADERS,
         }
 

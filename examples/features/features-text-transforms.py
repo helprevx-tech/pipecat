@@ -60,6 +60,7 @@ from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
+from pipecat.transports.livekit.transport import LiveKitParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 from pipecat.utils.text.transforms import (
     email_to_speech,
@@ -81,6 +82,10 @@ transport_params = {
         audio_out_enabled=True,
     ),
     "daily": lambda: DailyParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+    ),
+    "livekit": lambda: LiveKitParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
     ),
@@ -111,9 +116,6 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             (r"\bSt\.", "Street"),
             (r"\bApt\.", "Apartment"),
             (r"\bvs\b", "versus"),
-            # IPA phoneme tags are only supported on ElevenLabs v2 models, and you need to set enable_ssml_parsing=True.
-            # More details here: https://elevenlabs.io/docs/overview/capabilities/text-to-speech/best-practices#phoneme-tags-for-v2-models
-            # (r"(?i)\bSiobhan\b", '<phoneme alphabet="ipa" ph="ʃəˈvɔːn">Siobhan</phoneme>'),
             # This is an alternative that works on all models.
             (r"(?i)\bSiobhan\b", "shi-VAWN"),
         ]

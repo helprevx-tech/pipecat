@@ -17,6 +17,7 @@ import json
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import quote, urlencode
 
 from loguru import logger
 from websockets.protocol import State
@@ -32,14 +33,42 @@ from pipecat.frames.frames import (
 from pipecat.processors.frame_processor import FrameProcessorSetup
 from pipecat.services.settings import TTSSettings
 from pipecat.services.tts_service import WebsocketTTSService
-from pipecat.transcriptions.language import Language
+from pipecat.transcriptions.language import Language, resolve_language
 from pipecat.utils.tracing.service_decorators import traced_tts
-from pipecat.utils.types import NOT_GIVEN, NotGiven
+from pipecat.utils.types import NOT_GIVEN, NotGiven, is_given
 
 # Together TTS streams 24 kHz signed 16-bit mono PCM for all models; the API does
 # not support requesting a different rate. The output transport resamples to the
 # pipeline's rate. See https://docs.together.ai/reference/audio-speech-websocket
 TOGETHER_TTS_SAMPLE_RATE = 24000
+
+
+def language_to_together_language(language: Language) -> str:
+    """Convert a Language enum to a Together AI language code.
+
+    Together accepts ISO 639-1 codes and lowercase locale codes (``zh-hk``).
+    Regional variants without a verified locale code fall back to their base
+    language code.
+
+    Args:
+        language: The Language enum value to convert.
+
+    Returns:
+        The corresponding Together AI language code.
+    """
+    LANGUAGE_MAP = {
+        Language.EN: "en",
+        Language.ES: "es",
+        Language.FR: "fr",
+        Language.HI: "hi",
+        Language.IT: "it",
+        Language.JA: "ja",
+        Language.PT: "pt",
+        Language.ZH: "zh",
+        Language.ZH_HK: "zh-hk",
+    }
+
+    return resolve_language(language, LANGUAGE_MAP, use_base_code=True)
 
 
 @dataclass
@@ -133,9 +162,9 @@ class TogetherTTSService(WebsocketTTSService):
             language: The language to convert.
 
         Returns:
-            The language code string, or None if not supported.
+            The Together AI language code.
         """
-        return str(language)
+        return language_to_together_language(language)
 
     async def _update_settings(self, delta: TTSSettings) -> dict[str, Any]:
         """Apply a settings delta and reconnect if anything changed."""
@@ -149,10 +178,15 @@ class TogetherTTSService(WebsocketTTSService):
 
     def _build_websocket_url(self) -> str:
         """Build the WebSocket URL with query parameters."""
-        url = f"{self._url}?model={self._settings.model}&voice={self._settings.voice}"
+        params: dict[str, Any] = {"model": self._settings.model, "voice": self._settings.voice}
+        if is_given(self._settings.language) and self._settings.language:
+            params["language"] = self._settings.language
         if self._settings.max_partial_length is not None:
-            url += f"&max_partial_length={self._settings.max_partial_length}"
-        return url
+            params["max_partial_length"] = self._settings.max_partial_length
+        # Kokoro blends voices with a `+`-separated name such as
+        # "af_bella(2)+af_heart(1)", which has to be escaped or the server reads
+        # the `+` as a space and rejects the voice.
+        return f"{self._url}?{urlencode(params, quote_via=quote, safe='/')}"
 
     async def setup(self, setup: FrameProcessorSetup):
         """Set up the service and connect.
@@ -354,9 +388,8 @@ class TogetherTTSService(WebsocketTTSService):
             try:
                 await self.stop_ttfb_metrics()
                 context_id = self.get_active_audio_context_id()
-                audio_chunk = base64.b64decode(delta)
                 frame = TTSAudioRawFrame(
-                    audio=audio_chunk,
+                    audio=base64.b64decode(delta),
                     sample_rate=self.sample_rate,
                     num_channels=1,
                     context_id=context_id,
