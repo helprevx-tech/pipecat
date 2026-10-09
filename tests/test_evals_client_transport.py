@@ -24,6 +24,7 @@ from pipecat.frames.frames import (
     InputAudioRawFrame,
     InputTransportMessageFrame,
     InterruptionFrame,
+    OutputAudioRawFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.transports.websocket.client import WebsocketClientParams
@@ -50,6 +51,19 @@ class TestEvalHarnessOutput(unittest.IsolatedAsyncioTestCase):
                 await task
             except asyncio.CancelledError:
                 pass
+
+    async def test_buffering_is_success_but_forwarding_waits_for_pacing(self):
+        session = _fake_session()
+        out = EvalClientOutputTransport(
+            None, session, WebsocketClientParams(audio_out_enabled=True)
+        )
+        frame = OutputAudioRawFrame(audio=b"\x01\x02" * 80, sample_rate=self.SR, num_channels=1)
+        self.assertTrue(await out.write_audio_frame(frame))
+        self.assertEqual(out._pending, frame.audio)
+        self.assertFalse(out._should_forward_audio_frame(frame))
+        session.is_connected = False
+        self.assertFalse(await out.write_audio_frame(frame))
+        self.assertEqual(out._pending, frame.audio)
 
     async def test_paces_queued_audio_then_silence(self):
         out = EvalClientOutputTransport(

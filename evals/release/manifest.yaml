@@ -168,6 +168,8 @@ suite:
     scenarios: [scripted/weather_function_call_audio]
   - bot: realtime/realtime-azure.py
     scenarios: [scripted/weather_function_call_audio]
+  - bot: realtime/realtime-azure-voice-live.py
+    scenarios: [scripted/weather_function_call_audio]
   - bot: realtime/realtime-gemini-live.py
     scenarios: [scripted/weather_function_call_audio]
   - bot: realtime/realtime-grok.py
@@ -344,6 +346,17 @@ suite:
     runner_body:
       path: scenarios/vision-cat.yaml
     scenarios: [scripted/vision_describe]
+
+  #
+  # Image generation: the bot generates an image from a fixed prompt when the
+  # harness connects; the scenario waits for the image.
+  #
+  - bot: image-generation/image-generation-fal.py
+    scenarios: [scripted/generate_image]
+  - bot: image-generation/image-generation-google.py
+    scenarios: [scripted/generate_image]
+  - bot: image-generation/image-generation-openai.py
+    scenarios: [scripted/generate_image]
 
   #
   # Turn management: the user trails off mid-thought, then completes it after a

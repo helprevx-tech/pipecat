@@ -24,6 +24,9 @@ def _make_service(
 ) -> _TestGeminiLiveLLMService:
     service = _TestGeminiLiveLLMService(
         api_key="test-key",
+        settings=GeminiLiveLLMService.Settings(
+            model="models/gemini-2.5-flash-native-audio-preview-12-2025"
+        ),
         system_instruction=system_instruction,
         inference_on_context_initialization=inference_on_context_initialization,
     )

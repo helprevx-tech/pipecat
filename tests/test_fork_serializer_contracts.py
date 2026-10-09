@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-"""Contract tests for Dograh-owned telephony serializers."""
+"""Contract tests for the fork's telephony serializers."""
 
 from types import SimpleNamespace
 

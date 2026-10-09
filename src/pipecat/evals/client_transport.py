@@ -232,8 +232,8 @@ class EvalClientOutputTransport(WebsocketClientOutputTransport):
     async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
         """Queue the user audio for the send task.
 
-        Returns False so the media sender does not push this un-paced frame
-        downstream; the send task pushes the paced frames instead.
+        Return success once buffered. The pacing task forwards frames on its
+        own clock, independently of whether the transport accepted this write.
         """
         if self._session.is_closing or not self._session.is_connected:
             return False
@@ -242,6 +242,10 @@ class EvalClientOutputTransport(WebsocketClientOutputTransport):
         if self._recorder is not None:
             self._recorder.add_user(frame.audio, frame.sample_rate)
         self._pending.extend(frame.audio)
+        return True
+
+    def _should_forward_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
+        """Let the send task forward paced frames, avoiding duplicate unpaced audio."""
         return False
 
     async def _send_task_handler(self):

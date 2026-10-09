@@ -27,10 +27,10 @@ from tests.frame_processor_helpers import frame_processor_setup
 
 SAMPLE_RATE = 8000
 
-# Copied verbatim from a production Asterisk 22.11.0 call.
+# Asterisk 22.11.0 control-message format with synthetic application identifiers.
 MEDIA_START_PLAIN = (
-    "MEDIA_START connection_id:dograh channel:WebSocket/dograh/0x78b36c003130 "
-    "channel_id:dograh-ext-98fc90e9-3f20-4244-b20a-ecb5e52da23e "
+    "MEDIA_START connection_id:aayiqagent channel:WebSocket/aayiqagent/0x78b36c003130 "
+    "channel_id:aayiqagent-ext-98fc90e9-3f20-4244-b20a-ecb5e52da23e "
     "format:ulaw optimal_frame_size:160 ptime:20"
 )
 
@@ -41,9 +41,9 @@ class TestParseControlMessage(unittest.TestCase):
 
         assert message == {
             "event": "MEDIA_START",
-            "connection_id": "dograh",
-            "channel": "WebSocket/dograh/0x78b36c003130",
-            "channel_id": "dograh-ext-98fc90e9-3f20-4244-b20a-ecb5e52da23e",
+            "connection_id": "aayiqagent",
+            "channel": "WebSocket/aayiqagent/0x78b36c003130",
+            "channel_id": "aayiqagent-ext-98fc90e9-3f20-4244-b20a-ecb5e52da23e",
             "format": "ulaw",
             "optimal_frame_size": "160",
             "ptime": "20",
@@ -92,7 +92,7 @@ class TestAsteriskDeserializeControlMessages(unittest.IsolatedAsyncioTestCase):
         self.serializer = AsteriskFrameSerializer(
             channel_id="test-channel",
             ari_endpoint="http://asterisk:8088",
-            app_name="dograh",
+            app_name="aayiqagent",
             app_password="secret",
         )
         await self.serializer.setup(

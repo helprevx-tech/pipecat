@@ -23,7 +23,7 @@ from PIL import Image
 
 from pipecat.audio.dtmf.utils import load_dtmf_audio
 from pipecat.audio.mixers.base_audio_mixer import BaseAudioMixer
-from pipecat.audio.utils import create_stream_resampler, is_silence
+from pipecat.audio.utils import create_stream_resampler, is_silence, scale_audio
 from pipecat.frames.frames import (
     AssistantImageRawFrame,
     BotSpeakingFrame,
@@ -32,6 +32,7 @@ from pipecat.frames.frames import (
     CancelFrame,
     CancelWorkerFrame,
     EndFrame,
+    FilterControlFrame,
     Frame,
     InterruptionFrame,
     MixerControlFrame,
@@ -48,13 +49,19 @@ from pipecat.frames.frames import (
     SystemFrame,
     TTSAudioRawFrame,
     TTSStoppedFrame,
+    VolumeFrame,
+    VolumeGainFrame,
 )
+from pipecat.pipeline.capabilities import BotCapabilities
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor, FrameProcessorSetup
 from pipecat.transports.base_transport import TransportParams
+from pipecat.utils.deprecation import warn_deprecated
 from pipecat.utils.frame_queue import FrameQueue
 from pipecat.utils.time import nanoseconds_to_seconds
 
 BOT_VAD_STOP_SECS = 0.35
+# Public compatibility constant used by Tavus; base transports use per-instance settings.
+BOT_VAD_STOP_FALLBACK_SECS = 3
 
 
 class BaseOutputTransport(FrameProcessor):
@@ -91,16 +98,11 @@ class BaseOutputTransport(FrameProcessor):
         self._media_senders: dict[Any, BaseOutputTransport.MediaSender] = {}
 
         if params.video_out_bitrate is not None:
-            import warnings
-
-            with warnings.catch_warnings():
-                warnings.simplefilter("always")
-                warnings.warn(
-                    "Transport parameter `video_out_bitrate` is deprecated and will be removed in "
-                    "2.0.0. Use provider specific settings instead.",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
+            warn_deprecated(
+                "`TransportParams.video_out_bitrate` is deprecated since 1.1.0 and will be "
+                "removed in 2.0.0. Use provider-specific settings instead.",
+                stacklevel=2,
+            )
 
     @property
     def sample_rate(self) -> int:
@@ -120,6 +122,26 @@ class BaseOutputTransport(FrameProcessor):
         """
         return self._audio_chunk_size
 
+    @property
+    def capabilities(self) -> BotCapabilities:
+        """The media this transport sends to the user.
+
+        Returns:
+            The ``audio_out`` and ``video_out`` capabilities.
+        """
+        return BotCapabilities(
+            audio_out=self._params.audio_out_enabled, video_out=self._params.video_out_enabled
+        )
+
+    def _should_forward_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
+        """Whether the media sender forwards an accepted audio frame downstream.
+
+        Paced transports forward their accepted audio later, on their own clock.
+        Keep that choice separate from write success so the failure watchdog does
+        not treat accepted, buffered audio as a failed transport write.
+        """
+        return True
+
     async def setup(self, setup: FrameProcessorSetup):
         """Set up the transport.
 
@@ -135,11 +157,18 @@ class BaseOutputTransport(FrameProcessor):
         audio_bytes_10ms = int(self._sample_rate / 100) * self._params.audio_out_channels * 2
         self._audio_chunk_size = audio_bytes_10ms * self._params.audio_out_10ms_chunks
 
+        # Start audio filter. Paired with the stop in cleanup(), which is the
+        # only other call guaranteed to happen exactly once.
+        if self._params.audio_out_filter:
+            await self._params.audio_out_filter.start(self._sample_rate)
+
     async def cleanup(self):
         """Release output transport resources at teardown."""
         await super().cleanup()
         for _, sender in self._media_senders.items():
             await sender.cleanup()
+        if self._params.audio_out_filter:
+            await self._params.audio_out_filter.stop()
 
     async def start(self, frame: StartFrame):
         """Start the output transport.
@@ -457,6 +486,15 @@ class BaseOutputTransport(FrameProcessor):
             # The user can provide a single mixer, to be used by the default
             # destination, or a destination/mixer mapping.
             self._mixer: BaseAudioMixer | None = None
+
+            # The output filter belongs to the default destination, like a
+            # single mixer.
+            self._filter = None if destination else params.audio_out_filter
+
+            # The output volume (VolumeFrame) and the gain on it (VolumeGainFrame),
+            # updated in order with the audio.
+            self._volume = params.audio_out_volume
+            self._volume_gain = 1.0
 
             # These are the images that we should send at our desired framerate.
             self._video_images = None
@@ -895,8 +933,29 @@ class BaseOutputTransport(FrameProcessor):
                 if self._tts_audio_received:
                     logger.debug("Bot stopped speaking based on TTSStoppedFrame")
                     await self._bot_stopped_speaking()
+            elif isinstance(frame, FilterControlFrame) and self._filter:
+                await self._filter.process_frame(frame)
+            elif isinstance(frame, VolumeFrame):
+                self._volume = frame.volume
+            elif isinstance(frame, VolumeGainFrame):
+                self._volume_gain = frame.gain
             else:
                 await self._transport.write_transport_frame(frame)
+
+        async def _filter_audio(self, frame: Frame):
+            """Run the output filter over a frame taken from the audio queue.
+
+            Args:
+                frame: The queued frame. Only audio frames are filtered.
+            """
+            if self._filter and isinstance(frame, OutputAudioRawFrame):
+                frame.audio = await self._filter.filter(frame.audio)
+
+        def _apply_volume(self, frame: Frame):
+            """Scale an audio frame taken from the audio queue by the volume and its gain."""
+            volume = self._volume * self._volume_gain
+            if volume != 1.0 and isinstance(frame, OutputAudioRawFrame):
+                frame.audio = scale_audio(frame.audio, volume)
 
         def _next_frame(self) -> AsyncGenerator[Frame, None]:
             """Generate the next frame for audio processing.
@@ -911,6 +970,8 @@ class BaseOutputTransport(FrameProcessor):
                         frame = await asyncio.wait_for(
                             self._audio_queue.get(), timeout=vad_stop_secs
                         )
+                        await self._filter_audio(frame)
+                        self._apply_volume(frame)
                         yield frame
                         self._audio_queue.task_done()
                     except TimeoutError:
@@ -926,6 +987,8 @@ class BaseOutputTransport(FrameProcessor):
                 while True:
                     try:
                         frame = self._audio_queue.get_nowait()
+                        await self._filter_audio(frame)
+                        self._apply_volume(frame)
                         if isinstance(frame, OutputAudioRawFrame):
                             frame.audio = await mixer.mix(frame.audio)
                             last_frame_time = time.time()
@@ -977,6 +1040,10 @@ class BaseOutputTransport(FrameProcessor):
                     # Send some final silence so words don't cut out.
                     await self._send_silence(self._params.audio_out_end_silence_secs)
                     break
+
+                # Skip frames with no audio data (e.g. filter is buffering).
+                if isinstance(frame, OutputAudioRawFrame) and not frame.audio:
+                    continue
 
                 # Handle frame.
                 await self._handle_frame(frame)
@@ -1037,7 +1104,10 @@ class BaseOutputTransport(FrameProcessor):
 
                 # If we were able to send to the transport, push the frame
                 # downstream in case anyone else needs it.
-                if push_downstream:
+                if push_downstream and (
+                    not isinstance(frame, OutputAudioRawFrame)
+                    or self._transport._should_forward_audio_frame(frame)
+                ):
                     await self._transport.push_frame(frame)
 
         async def _internal_write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:

@@ -48,7 +48,7 @@ def _parse_control_message(data: str) -> dict | None:
     The plain-text form is the first token as the event name followed by
     space-separated key:value pairs::
 
-        MEDIA_START connection_id:dograh channel:WebSocket/dograh/0x78b3...
+        MEDIA_START connection_id:aayiqagent channel:WebSocket/aayiqagent/0x78b3...
             format:ulaw optimal_frame_size:160 ptime:20
 
     No value contains a space, so splitting on whitespace and then on the first

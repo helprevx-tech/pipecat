@@ -26,7 +26,7 @@ from pipecat.processors.aggregators.llm_context import LLMContext
 #
 
 # Grok supports configurable sample rates for PCM audio
-SUPPORTED_SAMPLE_RATES = Literal[8000, 16000, 22050, 24000, 32000, 44100, 48000]
+SUPPORTED_SAMPLE_RATES = Literal[8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000]
 
 
 class AudioFormat(BaseModel):
@@ -38,7 +38,7 @@ class AudioFormat(BaseModel):
 class PCMAudioFormat(AudioFormat):
     """PCM audio format configuration with configurable sample rate.
 
-    Grok supports: 8000, 16000, 22050, 24000, 32000, 44100, 48000 Hz
+    Grok supports: 8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000 Hz
 
     Parameters:
         type: Audio format type, always "audio/pcm".
@@ -109,7 +109,7 @@ class InputAudioTranscription(BaseModel):
         model: Transcription model. Defaults to ``grok-transcribe``: xAI only
             emits input-audio transcription events
             (``conversation.item.input_audio_transcription.updated``) when it is
-            explicitly enabled on the realtime session, and Dograh needs the user
+            explicitly enabled on the realtime session, and AayiqAgent needs the user
             transcripts. Pass ``None`` to leave transcription off.
         language_hint: BCP-47 language code to bias ASR.
         keyterms: Domain terms to bias transcription (max 100, ≤50 chars each).

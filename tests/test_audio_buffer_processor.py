@@ -1046,7 +1046,7 @@ def _bot_run():
     "upstream fires for the still-open turn when the pipeline ends. This fork "
     "deliberately does not end the turn there (see _handle_pipeline_end): observers are "
     "notified of EndFrame first, and ending the turn clears the current context, leaving "
-    "floating spans in Langfuse. Dograh does not set enable_turn_audio, so the feature is "
+    "floating spans in Langfuse. AayiqAgent does not set enable_turn_audio, so the feature is "
     "off in production. Revisit if the fork ever enables turn audio."
 )
 class TestTurnAudio(unittest.IsolatedAsyncioTestCase):

@@ -145,7 +145,7 @@ class SarvamLLMService(OpenAILLMService):
         non-fatal error frames rather than raised, so an ``LLMSwitcher`` can
         fall back to another service at runtime.
         """
-        error = self._validate_request(self._invocation_params(context))
+        error = self._validate_request(await self._invocation_params(context))
         if error:
             await self.push_error(error)
             return
@@ -177,7 +177,7 @@ class SarvamLLMService(OpenAILLMService):
             no response.
         """
         error = self._validate_request(
-            self._invocation_params(context, system_instruction=system_instruction)
+            await self._invocation_params(context, system_instruction=system_instruction)
         )
         if error:
             await self.push_error(error)
@@ -190,12 +190,12 @@ class SarvamLLMService(OpenAILLMService):
             response_schema=response_schema,
         )
 
-    def _invocation_params(
+    async def _invocation_params(
         self, context: LLMContext, system_instruction: str | None = None
     ) -> OpenAILLMInvocationParams:
         """Derive the invocation params the request will be built from."""
         adapter = self.get_llm_adapter()
-        return adapter.get_llm_invocation_params(
+        return await adapter.get_llm_invocation_params(
             context,
             system_instruction=system_instruction
             or assert_given(self._settings.system_instruction),
@@ -215,18 +215,8 @@ class SarvamLLMService(OpenAILLMService):
 
         model = self._settings.model
 
-        # wiki_grounding is Sarvam-specific and unknown to the OpenAI SDK,
-        # so it must be passed via extra_body to avoid TypeError.
-        extra_body = {}
-        if (
-            model in self._WIKI_GROUNDING_MODELS
-            and is_given(self._settings.wiki_grounding)
-            and self._settings.wiki_grounding is not None
-        ):
-            extra_body["wiki_grounding"] = self._settings.wiki_grounding
-
-        if extra_body:
-            params.setdefault("extra_body", {}).update(extra_body)
+        if model in self._WIKI_GROUNDING_MODELS:
+            self._merge_extra_body(params, {"wiki_grounding": self._settings.wiki_grounding})
 
         if (
             model in self._REASONING_MODELS

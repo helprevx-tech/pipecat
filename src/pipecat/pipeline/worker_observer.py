@@ -16,6 +16,7 @@ import weakref
 from typing import Any
 
 from attr import dataclass
+from loguru import logger
 
 from pipecat.frames.frames import Frame
 from pipecat.observers.base_observer import (
@@ -44,8 +45,13 @@ class Proxy:
     """
 
     queue: asyncio.Queue
-    task: asyncio.Task
     observer: BaseObserver
+    task: asyncio.Task | None = None
+    error: str | None = None
+
+
+class ObserverProcessingError(RuntimeError):
+    """An observer could not process all frames required for an artifact snapshot."""
 
 
 class _PipelineStartedSignal:
@@ -86,7 +92,7 @@ class WorkerObserver(BaseObserver):
         super().__init__(**kwargs)
         self._observers = observers or []
         self._proxies: dict[BaseObserver, Proxy] | None = (
-            None  # Becomes a dict after start() is called
+            None  # Becomes a dict after setup() is called
         )
         # Frames pushed so far, held weakly: an entry goes away with its
         # frame, so this tracks the frames in flight, not every frame ever
@@ -102,10 +108,9 @@ class WorkerObserver(BaseObserver):
         # Add the observer to the list.
         self._observers.append(observer)
 
-        # If we already started, create a new proxy for the observer.
-        # Otherwise, it will be created in start().
-        if self._proxies:
-            proxy = self._create_proxy(observer)
+        # After setup(), create the proxy immediately; setup() handles earlier additions.
+        if self._proxies is not None:
+            proxy = self._create_proxy(observer, setup_observer=True)
             self._proxies[observer] = proxy
 
     async def remove_observer(self, observer: BaseObserver):
@@ -145,10 +150,14 @@ class WorkerObserver(BaseObserver):
         """Wait until every observer has processed its currently queued frames."""
         if not self._proxies:
             return
-        await asyncio.gather(*(proxy.queue.join() for proxy in self._proxies.values()))
+        proxies = list(self._proxies.values())
+        await asyncio.gather(*(proxy.queue.join() for proxy in proxies))
         # Observer event handlers may outlive on_push_frame; finish them before
         # callers persist transcripts and other artifacts.
-        await asyncio.gather(*(BaseObject.cleanup(observer) for observer in self._proxies))
+        await asyncio.gather(*(BaseObject.cleanup(proxy.observer) for proxy in proxies))
+        failures = [proxy.error for proxy in proxies if proxy.error]
+        if failures:
+            raise ObserverProcessingError("; ".join(failures))
 
     async def cleanup(self):
         """Cleanup all proxy observers."""
@@ -193,7 +202,7 @@ class WorkerObserver(BaseObserver):
 
         for proxy in self._proxies.values():
             if data.first_push or proxy.observer.observe_every_push:
-                await proxy.queue.put(data)
+                await self._queue_proxy(proxy, data)
 
     async def on_processor_setup(self, data: ProcessorSetUp):
         """Queue processor setup timing for all managed observers.
@@ -219,11 +228,10 @@ class WorkerObserver(BaseObserver):
         """
         await self._send_to_proxy(data)
 
-    def _create_proxy(self, observer: BaseObserver) -> Proxy:
-        """Create a proxy for a single observer."""
-        queue = asyncio.Queue()
-        task = self.create_task(self._proxy_task_handler(queue, observer))
-        proxy = Proxy(queue=queue, task=task, observer=observer)
+    def _create_proxy(self, observer: BaseObserver, *, setup_observer: bool = False) -> Proxy:
+        """Create a proxy, initializing late observers before delivering any frames."""
+        proxy = Proxy(queue=asyncio.Queue(), observer=observer)
+        proxy.task = self.create_task(self._proxy_task_handler(proxy, setup_observer))
         return proxy
 
     def _create_proxies(self, observers: list[BaseObserver]) -> dict[BaseObserver, Proxy]:
@@ -238,22 +246,58 @@ class WorkerObserver(BaseObserver):
         if not self._proxies:
             return
         for proxy in self._proxies.values():
-            await proxy.queue.put(data)
+            await self._queue_proxy(proxy, data)
 
-    async def _proxy_task_handler(self, queue: asyncio.Queue, observer: BaseObserver):
-        """Handle frame processing for a single observer."""
-        while True:
-            data = await queue.get()
+    async def _queue_proxy(self, proxy: Proxy, data: Any):
+        if proxy.task is not None and proxy.task.done():
+            self._record_proxy_error(proxy, "received events after its processing task stopped")
+            return
+        await proxy.queue.put(data)
 
-            if isinstance(data, _PipelineStartedSignal):
-                await observer.on_pipeline_started()
-            elif isinstance(data, FramePushed):
-                await observer.on_push_frame(data)
-            elif isinstance(data, FrameProcessed):
-                await observer.on_process_frame(data)
-            elif isinstance(data, ProcessorSetUp):
-                await observer.on_processor_setup(data)
-            elif isinstance(data, StartupWarmup):
-                await observer.on_startup_warmup(data)
+    def _record_proxy_error(self, proxy: Proxy, description: str):
+        # Retain one bounded diagnostic per observer; the drain barrier must not
+        # certify artifacts after a callback failed or queued frames were lost.
+        if proxy.error is None:
+            proxy.error = f"{proxy.observer}: {description}"
+            logger.warning(proxy.error)
 
-            queue.task_done()
+    async def _proxy_task_handler(self, proxy: Proxy, setup_observer: bool = False):
+        """Deliver queued events without letting one callback strand the drain barrier."""
+        observer, queue = proxy.observer, proxy.queue
+        setup_failed = False
+        try:
+            if setup_observer:
+                try:
+                    await observer.setup(self.task_manager)
+                except Exception as exc:
+                    self._record_proxy_error(proxy, f"setup failed ({type(exc).__name__})")
+                    setup_failed = True
+            while True:
+                data = await queue.get()
+                try:
+                    if setup_failed:
+                        continue
+                    if isinstance(data, _PipelineStartedSignal):
+                        await observer.on_pipeline_started()
+                    elif isinstance(data, FramePushed):
+                        await observer.on_push_frame(data)
+                    elif isinstance(data, FrameProcessed):
+                        await observer.on_process_frame(data)
+                    elif isinstance(data, ProcessorSetUp):
+                        await observer.on_processor_setup(data)
+                    elif isinstance(data, StartupWarmup):
+                        await observer.on_startup_warmup(data)
+                except asyncio.CancelledError:
+                    self._record_proxy_error(proxy, "processing cancelled before completion")
+                    raise
+                except Exception as exc:
+                    self._record_proxy_error(proxy, f"processing failed ({type(exc).__name__})")
+                finally:
+                    queue.task_done()
+        finally:
+            # Cancellation may leave queued events with no consumer. Release
+            # joiners and report the loss rather than leaving finalization stuck.
+            while not queue.empty():
+                queue.get_nowait()
+                queue.task_done()
+                self._record_proxy_error(proxy, "stopped before queued events were processed")
