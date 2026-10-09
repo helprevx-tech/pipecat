@@ -186,7 +186,7 @@ class MCPClientTestBase(unittest.IsolatedAsyncioTestCase):
         server = _FakeServer(tools)
         ctx = patch.multiple(
             "pipecat.services.mcp_service",
-            _streamable_http_transport=lambda params: _FakeTransport(server),
+            _streamable_http_transport=lambda params, **kwargs: _FakeTransport(server),
             ClientSession=server.connect,
         )
         ctx.start()
@@ -617,7 +617,7 @@ class TestRealSession(MCPClientTestBase):
         connections = []
 
         @asynccontextmanager
-        async def transport(params):
+        async def transport(params, **kwargs):
             async with create_client_server_memory_streams() as (client_streams, server_streams):
                 serving = asyncio.create_task(_serve(server_streams))
                 connections.append(server_streams)
