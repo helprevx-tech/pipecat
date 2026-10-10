@@ -52,6 +52,43 @@ class TestUserTurnController(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.task_manager = TaskManager()
 
+    async def test_accepted_sequence_precedes_strategy_and_event_awaits(self):
+        """Accepted state is observable before any turn-start handler can yield."""
+        start = VADUserTurnStartStrategy()
+        controller = UserTurnController(
+            user_turn_strategies=UserTurnStrategies(
+                start=[start], stop=[ExternalUserTurnCompletionStopStrategy()]
+            )
+        )
+        await controller.setup(frame_processor_setup(self.task_manager))
+        await controller.start()
+        reached = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_start():
+            reached.set()
+            await release.wait()
+
+        start.handle_user_turn_started = slow_start
+        pending = asyncio.create_task(controller.process_frame(VADUserStartedSpeakingFrame()))
+        try:
+            await asyncio.wait_for(reached.wait(), 1)
+            self.assertEqual(controller.accepted_user_turn_sequence, 1)
+            # A duplicate during the callback cannot create another acceptance.
+            await controller.process_frame(VADUserStartedSpeakingFrame())
+            self.assertEqual(controller.accepted_user_turn_sequence, 1)
+            release.set()
+            await pending
+            await controller.process_frame(VADUserStoppedSpeakingFrame())
+            await controller.process_frame(UserTurnInferenceCompletedFrame())
+            self.assertEqual(controller.accepted_user_turn_sequence, 1)
+            await controller.process_frame(VADUserStartedSpeakingFrame())
+            self.assertEqual(controller.accepted_user_turn_sequence, 2)
+        finally:
+            release.set()
+            await pending
+            await controller.cleanup()
+
     async def test_completion_dropped_while_user_speaking(self):
         """A completion arriving while the user speaks must not stop the turn.
 

@@ -107,6 +107,7 @@ class UserTurnController(BaseObject):
         self._user_speaking = False
 
         self._user_turn = False
+        self._accepted_user_turn_sequence = 0
         self._user_turn_stop_timeout_event = asyncio.Event()
         self._user_turn_stop_timeout_task: asyncio.Task | None = None
 
@@ -203,6 +204,11 @@ class UserTurnController(BaseObject):
         return any(
             s.resolves_proposed_turn_stop_frames for s in self._user_turn_strategies.stop or []
         )
+
+    @property
+    def accepted_user_turn_sequence(self) -> int:
+        """Number of accepted turn starts, updated before callbacks can yield."""
+        return self._accepted_user_turn_sequence
 
     @property
     def has_active_user_turn(self) -> bool:
@@ -397,6 +403,7 @@ class UserTurnController(BaseObject):
             return
 
         self._user_turn = True
+        self._accepted_user_turn_sequence += 1
         self._user_turn_stop_timeout_event.set()
 
         # Notify every strategy that the turn has started. Start strategies
