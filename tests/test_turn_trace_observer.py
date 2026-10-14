@@ -4,10 +4,20 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+"""Qualify native conversation/turn tracing without requiring a vendor tracing SDK.
+
+The in-memory OpenTelemetry exporter owns recorded spans; each test provider is
+shut down after its case. Trace-URL cases explicitly simulate the optional
+Langfuse module being present or absent, then close their conversation spans in
+finally blocks. No SDK installation or remote trace export is required.
+"""
+
 import asyncio
+import sys
 import threading
 import unittest
-from unittest.mock import patch
+from types import ModuleType
+from unittest.mock import Mock, patch
 
 try:
     from opentelemetry.sdk.trace import TracerProvider
@@ -117,19 +127,37 @@ class TestTurnTraceObserver(unittest.IsolatedAsyncioTestCase):
         return [s for s in self._exporter.get_finished_spans() if "turn.number" in s.attributes]
 
     def test_trace_url_can_be_retrieved_for_persistence(self):
+        """Resolve the actual trace ID through an injected optional SDK client, then close the span."""
         _, _, trace_observer, _ = self._create_observers(conversation_id="persisted-call")
         trace_observer.start_conversation_tracing("persisted-call")
-        trace_id = trace_observer.get_trace_id()
-        self.assertIsNotNone(trace_id)
-        expected_url = f"https://langfuse.example/project/test/traces/{trace_id}"
-
-        with patch("langfuse.get_client") as get_client:
+        try:
+            trace_id = trace_observer.get_trace_id()
+            self.assertIsNotNone(trace_id)
+            expected_url = f"https://langfuse.example/project/test/traces/{trace_id}"
+            get_client = Mock()
             get_client.return_value.get_trace_url.return_value = expected_url
+            sdk = ModuleType("langfuse")
+            sdk.get_client = get_client
 
-            self.assertEqual(trace_observer.get_trace_url(), expected_url)
-            get_client.return_value.get_trace_url.assert_called_once_with(trace_id=trace_id)
+            # Supply the optional import boundary without importing or installing
+            # Langfuse; the native observer still resolves and forwards its ID.
+            with patch.dict(sys.modules, {"langfuse": sdk}):
+                self.assertEqual(trace_observer.get_trace_url(), expected_url)
+                get_client.assert_called_once_with()
+                get_client.return_value.get_trace_url.assert_called_once_with(trace_id=trace_id)
+        finally:
+            trace_observer.end_conversation_tracing()
 
-        trace_observer.end_conversation_tracing()
+    def test_trace_url_is_unavailable_without_optional_langfuse_sdk(self):
+        """An active native trace returns no vendor URL when the optional SDK cannot import."""
+        _, _, trace_observer, _ = self._create_observers(conversation_id="sdk-unavailable")
+        trace_observer.start_conversation_tracing("sdk-unavailable")
+        try:
+            self.assertIsNotNone(trace_observer.get_trace_id())
+            with patch.dict(sys.modules, {"langfuse": None}):
+                self.assertIsNone(trace_observer.get_trace_url())
+        finally:
+            trace_observer.end_conversation_tracing()
 
     async def test_conversation_span_created_on_start_frame(self):
         """Test that a conversation span is created when StartFrame is observed."""
