@@ -223,8 +223,6 @@ class LLMAssistantAggregatorParams:
     """Parameters for configuring LLM assistant aggregation behavior.
 
     Parameters:
-        correct_aggregation_callback: Optional ``str -> str`` hook applied to the
-            aggregated assistant text before it is added to the context.
         enable_auto_context_summarization: Enable automatic context summarization when token
             or message-count limits are reached (disabled by default). When enabled,
             older conversation messages are automatically compressed into summaries to
@@ -1358,7 +1356,11 @@ class LLMUserAggregator(LLMContextAggregator):
         await self._user_turn_controller.force_user_turn_stop()
 
     async def _handle_node_transition_started(self, frame: NodeTransitionStartedFrame):
-        """Commit pending user text before acknowledging a node handoff."""
+        """Commit pending user text before acknowledging a node handoff.
+
+        Retire the deferred transcript flush so it cannot start inference on the
+        connection being replaced. The transition's result owns the next response.
+        """
         if not frame.context_aggregation_event:
             return
         await self._cancel_realtime_handoff_flush_task()

@@ -1285,7 +1285,10 @@ class TestBotFrameSink(unittest.IsolatedAsyncioTestCase):
     """The sink is the boundary between the bot's side of the pipeline and the user's."""
 
     def _sink(self, **kwargs) -> tuple[_BotFrameSink, _Collector]:
+        """Build a direct-feed sink; native scheduling belongs to pipeline tests."""
         sink = _BotFrameSink(_stream(bot_audio=True), **kwargs)
+        # These units install no TaskManager and inspect only relay behavior.
+        sink._start_interruption = AsyncMock()
         nxt = _Collector()
         sink.link(nxt)
         return sink, nxt
@@ -1400,9 +1403,13 @@ class TestPersonaTurnRelay(unittest.IsolatedAsyncioTestCase):
     """The persona's text-mode responses become one send-text each."""
 
     def _relay(self) -> tuple[_PersonaTurnRelay, _Collector, EvalTrace]:
+        """Build a direct-feed relay; native task scheduling belongs to pipeline tests."""
         trace = EvalTrace()
         stream = _stream(bot_audio=True)
         relay = _PersonaTurnRelay(lambda text: {"type": "send-text", "text": text}, trace, stream)
+        # These units do not start a pipeline or install a task manager. Keep
+        # interruption's scheduler boundary explicit instead of leaking a coroutine.
+        relay._start_interruption = AsyncMock()
         nxt = _Collector()
         relay.link(nxt)
         return relay, nxt, trace

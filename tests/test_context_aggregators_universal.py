@@ -889,6 +889,7 @@ class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stop_messages[0][1].content, "Hello!")
 
     async def test_node_transition_started_commits_pending_transcription(self):
+        """A handoff commits caller text without triggering the retiring model."""
         context = LLMContext()
         user_aggregator = LLMUserAggregator(context, _realtime_service_mode=True)
         context_aggregation_event = asyncio.Event()
@@ -924,10 +925,8 @@ class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
                 "content": "The answer that selected this node",
             },
         )
-        self.assertLess(
-            next(i for i, frame in enumerate(down_frames) if frame is transition_frame),
-            next(i for i, frame in enumerate(down_frames) if isinstance(frame, LLMContextFrame)),
-        )
+        self.assertIn(transition_frame, down_frames)
+        self.assertFalse(any(isinstance(frame, LLMContextFrame) for frame in down_frames))
 
     async def test_pending_transcription_emitted_on_end_frame(self):
         """Pending user transcription should be emitted when EndFrame arrives."""

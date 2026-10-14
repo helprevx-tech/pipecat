@@ -1,3 +1,5 @@
+# Upstream publication, paid research and issue/docs mutation are not fork CI.
+# Gate each job by exact repository identity; retain its existing admission conditions.
 name: publish
 
 on:
@@ -10,6 +12,7 @@ on:
 
 jobs:
   build:
+    if: github.repository == 'pipecat-ai/pipecat'
     name: 'Build and upload wheels'
     runs-on: ubuntu-latest
     steps:
@@ -35,6 +38,7 @@ jobs:
           path: ./dist
 
   publish-to-pypi:
+    if: github.repository == 'pipecat-ai/pipecat'
     name: 'Publish to PyPI'
     runs-on: ubuntu-latest
     needs: [build]
@@ -56,6 +60,7 @@ jobs:
           print-hash: true
 
   publish-to-test-pypi:
+    if: github.repository == 'pipecat-ai/pipecat'
     name: 'Publish to Test PyPI'
     runs-on: ubuntu-latest
     needs: [build]
@@ -83,6 +88,7 @@ jobs:
   # release notes, reformatted for GitHub by scripts/release-changelog.py. A tag
   # whose version has no changelog section fails the run.
   github-release:
+    if: github.repository == 'pipecat-ai/pipecat'
     name: 'Create GitHub Release'
     runs-on: ubuntu-latest
     needs: [publish-to-pypi]

@@ -28,6 +28,17 @@ class FrameSerializer(BaseObject):
     serialize/deserialize methods.
     """
 
+    supports_output_audio_boundary: bool = False
+    """Whether output filter state can be flushed/reset between opaque audio owners.
+
+    Guarded transports reject an unsupported serializer before streaming. Stateless
+    serializers may explicitly opt in; stateful serializers must implement the
+    output-tail hooks. This does not change ordinary serialization or wire data.
+    """
+
+    output_audio_packet_padding: bytes = b"\x00"
+    """One codec-correct silence byte for padding a guarded binary packet remainder."""
+
     class InputParams(BaseModel):
         """Base configuration parameters for FrameSerializer.
 
@@ -78,6 +89,25 @@ class FrameSerializer(BaseObject):
 
         Args:
             setup: Configuration object containing setup parameters.
+        """
+        pass
+
+    async def flush_output_audio(self) -> str | bytes | None:
+        """Finish the previous owner's output filter using its existing wire encoding.
+
+        Only an opted-in transport calls this hook, retaining and checking that
+        owner's opaque context around the await and sends. The stateless default
+        has no tail; stateful implementations must flush output state only and
+        must not invoke hangup/transfer or otherwise contact a provider.
+        """
+        return None
+
+    async def reset_output_audio(self) -> None:
+        """Discard abandoned output filter state without changing inbound decoding.
+
+        Guarded transports use this when an owner is stale or interrupted. The
+        stateless default owns no output state. No ordinary caller is opted in
+        implicitly, so existing no-policy serialization remains unchanged.
         """
         pass
 

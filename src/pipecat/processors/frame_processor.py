@@ -9,6 +9,8 @@
 This module provides the core frame processing system that enables building
 audio/video processing pipelines. It includes frame processors, pipeline
 management, and frame flow control mechanisms.
+Protected forwarding checks can fence retained frame provenance around observer
+and event-handler awaits without changing ordinary processor behavior.
 """
 
 from __future__ import annotations
@@ -1011,11 +1013,16 @@ class FrameProcessor(BaseObject):
             frame: The frame to push.
             direction: The direction to push the frame.
         """
+        if not self._should_push_frame(frame, direction):
+            return
         await self._call_event_handler("on_before_push_frame", frame)
+        if not self._should_push_frame(frame, direction):
+            return
 
         await self.__internal_push_frame(frame, direction)
 
-        await self._call_event_handler("on_after_push_frame", frame)
+        if self._should_push_frame(frame, direction):
+            await self._call_event_handler("on_after_push_frame", frame)
 
     async def broadcast_interruption(self):
         """Broadcast an `InterruptionFrame` both upstream and downstream."""
@@ -1159,6 +1166,17 @@ class FrameProcessor(BaseObject):
                 category=ErrorCategory.UNKNOWN,
             )
 
+    def _should_push_frame(self, frame: Frame, direction: FrameDirection) -> bool:
+        """Check whether an original queued frame may cross its next boundary.
+
+        Subclasses can fence retained provenance without replacing forwarding.
+        The check is synchronous and runs before observers and again after their
+        awaits. An observer already invoked cannot be retrospectively withdrawn;
+        the second check protects the adjacent processor's actual queue insertion.
+        The default permits every frame and preserves ordinary forwarding.
+        """
+        return True
+
     async def __internal_push_frame(self, frame: Frame, direction: FrameDirection):
         """Internal method to push frames to adjacent processors.
 
@@ -1168,6 +1186,8 @@ class FrameProcessor(BaseObject):
         """
         observer = self._setup.observer if self._setup else None
         try:
+            if not self._should_push_frame(frame, direction):
+                return
             timestamp = self.get_clock().get_time() if self._setup else 0
             if direction == FrameDirection.DOWNSTREAM and self._next:
                 logger.trace(f"Pushing {frame} downstream from {self} to {self._next}")
@@ -1181,6 +1201,8 @@ class FrameProcessor(BaseObject):
                         timestamp=timestamp,
                     )
                     await observer.on_push_frame(data)
+                if not self._should_push_frame(frame, direction):
+                    return
                 await self._next.queue_frame(frame, direction)
             elif direction == FrameDirection.UPSTREAM and self._prev:
                 logger.trace(f"Pushing {frame} upstream from {self} to {self._prev}")
@@ -1193,6 +1215,8 @@ class FrameProcessor(BaseObject):
                         timestamp=timestamp,
                     )
                     await observer.on_push_frame(data)
+                if not self._should_push_frame(frame, direction):
+                    return
                 await self._prev.queue_frame(frame, direction)
         except Exception as e:
             # Observers and the downstream processor run inside this

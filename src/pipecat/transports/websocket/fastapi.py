@@ -9,6 +9,10 @@
 This module provides WebSocket-based transport for real-time audio/video streaming
 using FastAPI and WebSocket connections. Supports binary and text serialization
 with configurable session timeouts and WAV header generation.
+
+An optional output policy preserves opaque source ownership through serializer
+filters, packet remainders and final sends. Policy-free callers retain their
+existing buffering, wire data and disconnect behavior.
 """
 
 import asyncio
@@ -32,11 +36,17 @@ from pipecat.frames.frames import (
     OutputTransportMessageFrame,
     OutputTransportMessageUrgentFrame,
     StartFrame,
+    TTSStoppedFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessorSetup
 from pipecat.serializers.base_serializer import FrameSerializer
 from pipecat.transports.base_input import BaseInputTransport
-from pipecat.transports.base_output import BaseOutputTransport
+from pipecat.transports.base_output import (
+    AUDIO_OUTPUT_DISCARDED,
+    AudioOutputDiscarded,
+    AudioOutputPolicy,
+    BaseOutputTransport,
+)
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.utils.enums import EndTaskReason
 from pipecat.utils.security.allowed_origins import default_allowed_origins, is_origin_allowed
@@ -55,6 +65,9 @@ except ModuleNotFoundError as e:
 # Default time (in seconds) to wait for the WebSocket close handshake in
 # ``FastAPIWebsocketClient.disconnect()`` before proceeding with shutdown.
 _WS_CLOSE_TIMEOUT_DEFAULT = 0.5
+
+# Unlike a captured None, this value means no output filter owns buffered audio.
+_NO_AUDIO_OUTPUT_CONTEXT = object()
 
 
 class FastAPIWebsocketParams(TransportParams):
@@ -168,19 +181,36 @@ class FastAPIWebsocketClient:
         """
         return _WebSocketMessageIterator(self._websocket)
 
-    async def send(self, data: str | bytes):
+    async def send(self, data: str | bytes, *, send_guard: Callable[[], bool] | None = None):
         """Send data through the WebSocket connection.
 
         Args:
             data: The data to send (string or bytes).
+            send_guard: Optional pure source check immediately before the socket
+                call. A deliberate stale drop returns AUDIO_OUTPUT_DISCARDED;
+                guarded I/O failures return False. Ordinary callers retain the
+                existing None result and exception logging. Cancellation always
+                propagates; a started remote write is never retried here.
         """
         try:
+            if send_guard is not None and send_guard() is not True:
+                return AUDIO_OUTPUT_DISCARDED
             if self._can_send():
                 if isinstance(data, bytes):
                     await self._websocket.send_bytes(data)
                 else:
                     await self._websocket.send_text(data)
+                if send_guard is not None:
+                    return True
+            elif send_guard is not None:
+                return False
         except Exception as e:
+            if send_guard is not None:
+                logger.warning(
+                    f"{self} guarded send failed: {e.__class__.__name__}, "
+                    f"application_state: {self._websocket.application_state}"
+                )
+                return False
             logger.warning(
                 f"{self} exception sending data: {e.__class__.__name__} ({e}), application_state: {self._websocket.application_state}"
             )
@@ -457,6 +487,35 @@ class FastAPIWebsocketOutputTransport(BaseOutputTransport):
         # emitted, preserving any remainder for subsequent sends.
         self._audio_send_buffer = bytearray()
 
+        # Native audio writes run in a media task while urgent/control frames can
+        # serialize concurrently. Only the opted-in path takes this lock: its
+        # output filter and packet remainder must belong to one exact context.
+        self._audio_serialization_lock = asyncio.Lock()
+        self._audio_serialization_context = _NO_AUDIO_OUTPUT_CONTEXT
+        self._audio_serialization_context_id: str | None = None
+        self._audio_serialization_destination: str | None = None
+        self._audio_serialization_failed = False
+
+    def validate_audio_output_policy(self, policy: AudioOutputPolicy | None = None) -> None:
+        """Preflight actual serializer boundaries before guarded media is built.
+
+        No-argument validation checks this transport's current configuration;
+        supplied policies also use the base callback/filter validation. No
+        provider request or serializer setup is performed.
+        """
+        super().validate_audio_output_policy(policy)
+        serializer = self._params.serializer
+        if serializer is None or serializer.supports_output_audio_boundary is not True:
+            raise ValueError("WebSocket serializer does not support guarded audio boundaries")
+        if (
+            not isinstance(serializer.output_audio_packet_padding, bytes)
+            or len(serializer.output_audio_packet_padding) != 1
+        ):
+            raise ValueError("WebSocket serializer has invalid audio packet padding")
+        packet_bytes = self._params.fixed_audio_packet_size
+        if packet_bytes is not None and (type(packet_bytes) is not int or packet_bytes <= 0):
+            raise ValueError("WebSocket guarded audio packet size must be positive")
+
     async def setup(self, setup: FrameProcessorSetup):
         """Set up the output transport with the frame processor setup.
 
@@ -509,8 +568,18 @@ class FastAPIWebsocketOutputTransport(BaseOutputTransport):
         await self._client.disconnect()
 
     async def cleanup(self):
-        """Clean up transport resources."""
+        """Discard guarded filter/remainders and release the existing transport resources.
+
+        Cleanup never flushes abandoned speech or invokes a provider lifecycle
+        request. A reset error does not prevent socket/transport teardown.
+        """
         await super().cleanup()
+        if self.audio_output_policy_enabled:
+            async with self._audio_serialization_lock:
+                try:
+                    await self._reset_audio_output_boundary()
+                except Exception as e:
+                    logger.error(f"{self} output cleanup reset failed: {e.__class__.__name__}")
         await self._client.disconnect()
         await self._transport.cleanup()
 
@@ -525,7 +594,7 @@ class FastAPIWebsocketOutputTransport(BaseOutputTransport):
 
         if isinstance(frame, InterruptionFrame):
             # Drop any partially buffered audio to avoid replaying stale PCM
-            if self._params.fixed_audio_packet_size:
+            if self._params.fixed_audio_packet_size and not self.audio_output_policy_enabled:
                 self._audio_send_buffer.clear()
 
             await self._write_frame(frame)
@@ -541,15 +610,54 @@ class FastAPIWebsocketOutputTransport(BaseOutputTransport):
         """
         await self._write_frame(frame)
 
-    async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
+    async def write_transport_frame(self, frame: Frame) -> bool | AudioOutputDiscarded | None:
+        """Finish a guarded TTS response at its ordered native completion boundary.
+
+        The native sender invokes this before completed-playback bookkeeping and
+        handles returned failures with its bounded-write policy. Only the exact
+        retained serializer owner and actual TTS context may finish its tail; a
+        delayed stop never flushes another response. Ordinary callers keep the
+        inherited no-op behavior, with no new tail flush.
+        """
+        if not self.audio_output_policy_enabled or not isinstance(frame, TTSStoppedFrame):
+            return None
+        context = self.capture_audio_output_context(frame)
+        async with self._audio_serialization_lock:
+            if (
+                context != self._audio_serialization_context
+                or frame.context_id != self._audio_serialization_context_id
+                or frame.transport_destination != self._audio_serialization_destination
+            ):
+                return AUDIO_OUTPUT_DISCARDED
+            if self._client.is_closing or not self._client.is_connected:
+                return False
+            try:
+                return await self._finish_audio_output_boundary()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"{self} output response tail failed: {e.__class__.__name__}")
+                return False
+
+    async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool | AudioOutputDiscarded:
         """Write an audio frame to the WebSocket with timing simulation.
 
         Args:
             frame: The output audio frame to write.
 
         Returns:
-            True if the audio frame was written successfully, False otherwise.
+            True if the frame was taken, False on I/O/serialization failure, or
+            AUDIO_OUTPUT_DISCARDED when its original source became stale. An
+            intentional discard is not paced or reported as a writer failure.
         """
+        context = None
+        context_id = getattr(frame, "context_id", None)
+        destination = frame.transport_destination
+        interruptible = frame.interruptible
+        if self.audio_output_policy_enabled:
+            context = self.capture_audio_output_context(frame)
+            if not self.audio_output_context_is_current(context):
+                return AUDIO_OUTPUT_DISCARDED
         if self._client.is_closing or not self._client.is_connected:
             return False
 
@@ -558,6 +666,11 @@ class FastAPIWebsocketOutputTransport(BaseOutputTransport):
             sample_rate=self.sample_rate,
             num_channels=self._params.audio_out_channels,
         )
+        if self.audio_output_policy_enabled:
+            self.copy_audio_output_context(context, frame)
+            frame.context_id = context_id
+            frame.transport_destination = destination
+            frame.interruptible = interruptible
 
         if self._params.add_wav_header:
             frame = OutputAudioRawFrame(
@@ -565,22 +678,38 @@ class FastAPIWebsocketOutputTransport(BaseOutputTransport):
                 sample_rate=frame.sample_rate,
                 num_channels=frame.num_channels,
             )
+            if self.audio_output_policy_enabled:
+                self.copy_audio_output_context(context, frame)
+                frame.context_id = context_id
+                frame.transport_destination = destination
+                frame.interruptible = interruptible
 
-        if not await self._write_frame(frame):
+        written = await self._write_frame(frame)
+        if written is AUDIO_OUTPUT_DISCARDED:
+            return AUDIO_OUTPUT_DISCARDED
+        if not written:
             return False
 
         # Simulate audio playback with a sleep.
         await self._write_audio_sleep()
 
+        # Already-started sends are not recalled. This stops stale downstream
+        # speech accounting after the pacing await without retrying those bytes.
+        if self.audio_output_policy_enabled and not self.audio_output_context_is_current(context):
+            return AUDIO_OUTPUT_DISCARDED
+
         return True
 
-    async def _write_frame(self, frame: Frame) -> bool:
+    async def _write_frame(self, frame: Frame) -> bool | AudioOutputDiscarded:
         """Serialize and send a frame through the WebSocket.
 
         Returns:
             Whether the transport took the frame. A serializer that emits no
             payload has still taken it; see :meth:`FrameSerializer.serialize`.
+            Guarded stale audio returns the distinct intentional-discard value.
         """
+        if self.audio_output_policy_enabled:
+            return await self._write_guarded_frame(frame)
         if self._client.is_closing or not self._client.is_connected:
             return False
 
@@ -612,6 +741,184 @@ class FastAPIWebsocketOutputTransport(BaseOutputTransport):
             success = False
 
         return success
+
+    async def _reset_audio_output_boundary(self) -> None:
+        """Discard this serializer owner's filter and packet remainder together.
+
+        The guarded serialization lock is held by the caller. Buffer metadata is
+        cleared even if a custom reset fails; that failure is not permission to
+        relabel the retained bytes as another source.
+        """
+        try:
+            await self._params.serializer.reset_output_audio()
+        except Exception:
+            # A failed reset cannot safely admit another owner on this filter.
+            self._audio_serialization_failed = True
+            raise
+        finally:
+            self._audio_send_buffer.clear()
+            self._audio_serialization_context = _NO_AUDIO_OUTPUT_CONTEXT
+            self._audio_serialization_context_id = None
+            self._audio_serialization_destination = None
+
+    async def _send_guarded_payload(
+        self, payload: str | bytes, context: object | None, *, packetize: bool
+    ) -> bool | AudioOutputDiscarded:
+        """Send only payloads belonging to one retained owner under the lock.
+
+        Each actual send rechecks the same context in the native client. A
+        started send can be externally uncertain and is never requeued. Packet
+        remainders are used only for this owner's audio, never control messages.
+        """
+        if not self.audio_output_context_is_current(context):
+            return AUDIO_OUTPUT_DISCARDED
+
+        def current_source() -> bool:
+            """Recheck the retained immutable context at the final socket boundary."""
+            return self.audio_output_context_is_current(context)
+
+        packet_bytes = self._params.fixed_audio_packet_size if packetize else None
+        if packet_bytes and isinstance(payload, (bytes, bytearray)):
+            self._audio_send_buffer.extend(bytes(payload))
+            while len(self._audio_send_buffer) >= packet_bytes:
+                if not current_source():
+                    self._audio_send_buffer.clear()
+                    return AUDIO_OUTPUT_DISCARDED
+                chunk = bytes(self._audio_send_buffer[:packet_bytes])
+                del self._audio_send_buffer[:packet_bytes]
+                result = await self._client.send(chunk, send_guard=current_source)
+                if result is AUDIO_OUTPUT_DISCARDED or result is False:
+                    self._audio_send_buffer.clear()
+                    return result
+            return True
+        return await self._client.send(payload, send_guard=current_source)
+
+    async def _finish_audio_output_boundary(self) -> bool | AudioOutputDiscarded:
+        """Finish current old audio with source-owned tail/padding, or discard it.
+
+        The caller holds the guarded lock. Tail flushes and sends recheck the
+        previous owner; codec-correct padding cannot authorize neighboring stale
+        samples. Output state is reset before another source can serialize.
+        """
+        context = self._audio_serialization_context
+        if context is _NO_AUDIO_OUTPUT_CONTEXT:
+            return True
+        result: bool | AudioOutputDiscarded = True
+        try:
+            if not self.audio_output_context_is_current(context):
+                result = AUDIO_OUTPUT_DISCARDED
+            else:
+                payload = await self._params.serializer.flush_output_audio()
+                if not self.audio_output_context_is_current(context):
+                    result = AUDIO_OUTPUT_DISCARDED
+                elif payload:
+                    result = await self._send_guarded_payload(payload, context, packetize=True)
+                if result is True and self._audio_send_buffer:
+                    if not self.audio_output_context_is_current(context):
+                        result = AUDIO_OUTPUT_DISCARDED
+                    else:
+                        packet_bytes = self._params.fixed_audio_packet_size
+                        padding = self._params.serializer.output_audio_packet_padding
+                        payload = bytes(self._audio_send_buffer)
+                        if packet_bytes:
+                            payload += padding * (packet_bytes - len(payload))
+                        self._audio_send_buffer.clear()
+                        result = await self._send_guarded_payload(payload, context, packetize=False)
+        except BaseException:
+            # A cleanup error must not replace original cancellation/failure.
+            try:
+                await self._reset_audio_output_boundary()
+            except (Exception, asyncio.CancelledError):
+                pass
+            raise
+        else:
+            await self._reset_audio_output_boundary()
+        return result
+
+    async def _write_guarded_frame(self, frame: Frame) -> bool | AudioOutputDiscarded:
+        """Serialize under one original audio owner and fence every derived send.
+
+        Audio, urgent controls and shutdown share the serializer but may arrive
+        from different native tasks. Only this opted-in branch serializes their
+        filter/buffer transitions. Stale audio never reaches the serializer;
+        cancellation drops uncertain retained output and always propagates.
+        """
+        is_audio = isinstance(frame, OutputAudioRawFrame)
+        context = self.capture_audio_output_context(frame) if is_audio else None
+        context_id = getattr(frame, "context_id", None)
+        async with self._audio_serialization_lock:
+            try:
+                if self._audio_serialization_failed and is_audio:
+                    return False
+                if self._client.is_closing or not self._client.is_connected:
+                    return False
+                boundary_failed = False
+                if is_audio:
+                    if not self.audio_output_context_is_current(context):
+                        old = self._audio_serialization_context
+                        if old is not _NO_AUDIO_OUTPUT_CONTEXT and not (
+                            self.audio_output_context_is_current(old)
+                        ):
+                            await self._reset_audio_output_boundary()
+                        return AUDIO_OUTPUT_DISCARDED
+                    old = self._audio_serialization_context
+                    if old is not _NO_AUDIO_OUTPUT_CONTEXT and (
+                        old != context
+                        or context_id != self._audio_serialization_context_id
+                        or frame.transport_destination != self._audio_serialization_destination
+                    ):
+                        result = await self._finish_audio_output_boundary()
+                        if result is False:
+                            return False
+                        if not self.audio_output_context_is_current(context):
+                            return AUDIO_OUTPUT_DISCARDED
+                    self._audio_serialization_context = context
+                    self._audio_serialization_context_id = context_id
+                    self._audio_serialization_destination = frame.transport_destination
+                elif isinstance(frame, EndFrame):
+                    try:
+                        boundary_failed = await self._finish_audio_output_boundary() is False
+                    except Exception as e:
+                        # Tail I/O/reset failures must not suppress the existing
+                        # serializer's End/hangup cleanup. Cancellation still
+                        # propagates before starting another lifecycle effect.
+                        logger.error(f"{self} output tail cleanup failed: {e.__class__.__name__}")
+                        boundary_failed = True
+                elif isinstance(frame, (InterruptionFrame, CancelFrame)):
+                    try:
+                        await self._reset_audio_output_boundary()
+                    except Exception as e:
+                        logger.error(f"{self} output reset failed: {e.__class__.__name__}")
+                        boundary_failed = True
+
+                payload = await self._params.serializer.serialize(frame)
+                if is_audio and not self.audio_output_context_is_current(context):
+                    await self._reset_audio_output_boundary()
+                    return AUDIO_OUTPUT_DISCARDED
+                if not payload:
+                    return not boundary_failed
+                if is_audio:
+                    result = await self._send_guarded_payload(payload, context, packetize=True)
+                    if result is AUDIO_OUTPUT_DISCARDED:
+                        await self._reset_audio_output_boundary()
+                    return result
+                await self._client.send(payload)
+                return not boundary_failed
+            except asyncio.CancelledError:
+                # Cleanup cannot replace the caller's cancellation or retry a
+                # socket write whose external completion is unknown.
+                try:
+                    await self._reset_audio_output_boundary()
+                except (Exception, asyncio.CancelledError):
+                    pass
+                raise
+            except Exception as e:
+                logger.error(f"{self} guarded output failed: {e.__class__.__name__}")
+                try:
+                    await self._reset_audio_output_boundary()
+                except Exception:
+                    pass
+                return False
 
     async def _write_audio_sleep(self):
         """Simulate audio playback timing with appropriate delays."""

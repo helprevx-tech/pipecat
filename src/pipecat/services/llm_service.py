@@ -4,7 +4,13 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-"""Base classes for Large Language Model services with function calling support."""
+"""Base LLM services with registered tool execution and owned lifecycle cleanup.
+
+Services that require user-context aggregation must receive its acknowledgement
+before announcing or preparing a transition batch. Failed or cancelled waits do
+not transfer tool ownership; normal generation, interruption and dispatch fences
+remain responsible for accepted calls.
+"""
 
 from __future__ import annotations
 
@@ -83,9 +89,9 @@ from pipecat.utils.context.llm_context_summarization import (
 )
 from pipecat.utils.deprecation import deprecated, warn_deprecated
 from pipecat.utils.errors import ErrorCategory
-from pipecat.utils.text.alnum_utils import has_alnum
 from pipecat.utils.file_resolver import FileResolver
 from pipecat.utils.log_config import _get_llm_context_log_mode, _LLMContextLogMode
+from pipecat.utils.text.alnum_utils import has_alnum
 from pipecat.utils.types import assert_given
 
 if TYPE_CHECKING:
@@ -1777,6 +1783,8 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
 
         Realtime services that reconnect during node transitions can override
         this to require acknowledgement from the user context aggregator.
+        A required acknowledgement that times out prevents the batch from
+        being announced, prepared or dispatched.
         """
         return False
 
@@ -1875,9 +1883,18 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
 
         Triggers the on_function_calls_started event and executes functions
         either in parallel or sequentially based on the run_in_parallel setting.
+        Required transition aggregation completes before any call in the batch
+        is announced, prepared or dispatched. Other calls retain their normal
+        scheduling and ownership contract.
 
         Args:
             function_calls: The function calls to execute.
+
+        Raises:
+            TimeoutError: A service-required transition context acknowledgement
+                did not arrive. No tool in that batch has been accepted yet.
+            asyncio.CancelledError: Cancellation while awaiting aggregation
+                propagates without accepting or scheduling the batch.
         """
         if len(function_calls) == 0:
             return
@@ -1920,8 +1937,6 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
                         f"{self}: timed out waiting for user context aggregation "
                         "before node transition"
                     )
-                    # A required caller-context commit is a dispatch precondition.
-                    # Never reconnect or run tools after its acknowledgement failed.
                     raise
         if user_visible_calls:
             await self._call_event_handler("on_function_calls_started", user_visible_calls)

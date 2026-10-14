@@ -4,7 +4,11 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-"""Tests for Speechify TTS speech-mark and Server-Sent Events handling."""
+"""Qualify Speechify speech marks, SSE parsing, native PCM metadata and API version.
+
+Pure parsing cases and a local service constructor cover the timestamped-request
+contract without opening a provider session or making network requests.
+"""
 
 import pytest
 
@@ -223,5 +227,6 @@ class TestLanguageMapping:
 
 
 def test_timestamped_speech_requests_pin_api_version():
+    """Retain the public API-version header that enables timestamped Speechify audio."""
     service = SpeechifyHttpTTSService(api_key="test-key", aiohttp_session=None)
     assert service._headers["Speechify-Version"] == SPEECHIFY_API_VERSION == "2026-09-30"

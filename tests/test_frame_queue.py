@@ -79,3 +79,26 @@ class TestFramePriorityQueue(unittest.IsolatedAsyncioTestCase):
             queue.task_done()
         self.assertFalse(queue.has_uninterruptible)
         await asyncio.wait_for(queue.join(), timeout=1)
+
+
+class TestFrameQueueRetention(unittest.IsolatedAsyncioTestCase):
+    """The optional authority predicate only narrows protected-frame retention."""
+
+    async def test_reset_discards_revoked_protected_frames_and_preserves_join(self):
+        """Both real queue types retain current protected work and acknowledge every removal."""
+        for queue_type in (FrameQueue, FramePriorityQueue):
+            with self.subTest(queue_type=queue_type.__name__):
+                queue = queue_type(frame_getter=lambda item: item[2])
+                stale, current, normal, end = TextFrame("stale"), TextFrame("current"), TextFrame("normal"), EndFrame()
+                stale.interruptible = current.interruptible = False
+                for index, frame in enumerate((stale, current, normal, end)):
+                    queue.put_nowait((index, index, frame))
+
+                queue.reset(keep_frame=lambda frame: frame is not stale)
+
+                self.assertEqual(queue.qsize(), 2)
+                for expected in (current, end):
+                    self.assertIs(queue.get_nowait()[2], expected)
+                    queue.task_done()
+                await asyncio.wait_for(queue.join(), timeout=0.25)
+                self.assertEqual(queue._unfinished_tasks, 0)

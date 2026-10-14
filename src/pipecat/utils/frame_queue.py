@@ -71,12 +71,24 @@ class FrameQueue(asyncio.Queue):
             for item in self._queue  # pyright: ignore[reportAttributeAccessIssue]
         )
 
-    def reset(self) -> None:
-        """Remove all interruptible items, keeping uninterruptible ones."""
+    def reset(self, *, keep_frame: Callable[[Frame], bool] | None = None) -> None:
+        """Remove interruptible work, optionally narrowing protected-frame retention.
+
+        Args:
+            keep_frame: Synchronous eligibility check for each uninterruptible
+                frame. None retains the existing flag-only behavior. Transport
+                owners use it to discard protected payloads whose authority was
+                revoked; lifecycle frames remain eligible under their policy.
+        """
         kept = []
         while not self.empty():
             item = self.get_nowait()
-            if self._is_uninterruptible(item):
+            frame = self._frame_getter(item)
+            if (
+                frame is not None
+                and not frame.interruptible
+                and (keep_frame is None or keep_frame(frame))
+            ):
                 kept.append(item)
             self.task_done()
         for item in kept:

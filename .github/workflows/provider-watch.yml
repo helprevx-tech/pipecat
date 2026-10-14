@@ -1,3 +1,5 @@
+# Upstream publication, paid research and issue/docs mutation are not fork CI.
+# Gate each job by exact repository identity; retain its existing admission conditions.
 name: Provider watch
 
 # Provider research, every other week. Research jobs run the /provider-research skill,
@@ -45,6 +47,7 @@ env:
 
 jobs:
   plan:
+    if: github.repository == 'pipecat-ai/pipecat'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -95,7 +98,7 @@ jobs:
     needs: plan
     # An empty plan is a digest-only run; skipping here keeps the empty
     # matrix expression from ever being evaluated.
-    if: needs.plan.outputs.skip != 'true' && needs.plan.outputs.groups != '[]'
+    if: github.repository == 'pipecat-ai/pipecat' && (needs.plan.outputs.skip != 'true' && needs.plan.outputs.groups != '[]')
     runs-on: ubuntu-latest
     # The publish step mints its own token, so research only has to leave it
     # room inside the job timeout; the step timeout does that.
@@ -279,7 +282,7 @@ jobs:
     needs: [plan, research]
     # Digests even when some groups failed; whatever they pushed is in the
     # reports repo and belongs in it.
-    if: always() && needs.plan.result == 'success' && needs.plan.outputs.skip != 'true' && inputs.dry_run != true
+    if: github.repository == 'pipecat-ai/pipecat' && (always() && needs.plan.result == 'success' && needs.plan.outputs.skip != 'true' && inputs.dry_run != true)
     runs-on: ubuntu-latest
     timeout-minutes: 40
     # The digest skill authors highlights with the bot's Anthropic key, which

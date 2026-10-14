@@ -809,6 +809,8 @@ class DeepgramFluxSTTBase(EagerEndOfTurnSTTServiceMixin, STTService):
         The service will:
         - Propose a turn start, which the user turn strategies resolve into a
           UserStartedSpeakingFrame and an interruption
+        - Emit any initial transcript once so transcript-based strategies can
+          act before the first Update event arrives
 
         Args:
             transcript: maybe the first few words of the turn.
@@ -959,7 +961,6 @@ class DeepgramFluxSTTBase(EagerEndOfTurnSTTServiceMixin, STTService):
             data: The TurnInfo message data containing event type, transcript and some extra metadata.
         """
         if transcript:
-            await self._push_partial_transcript(transcript)
             logger.trace(f"Update event: {transcript}")
             # TTFB (Time To First Byte) metrics are currently disabled for Deepgram Flux.
             # Ideally, TTFB should measure the time from when a user starts speaking
@@ -979,7 +980,11 @@ class DeepgramFluxSTTBase(EagerEndOfTurnSTTServiceMixin, STTService):
             await self._call_event_handler("on_update", transcript)
 
     async def _push_partial_transcript(self, transcript: str) -> None:
-        """Expose current turn text to transcript-based interruption strategies."""
+        """Expose a nonempty StartOfTurn partial before later provider updates.
+
+        Update emits its own language/result-rich frame and must not call this
+        onset-only helper, or downstream observers receive the same text twice.
+        """
         if transcript:
             await self.push_frame(
                 InterimTranscriptionFrame(transcript, self._user_id, time_now_iso8601())

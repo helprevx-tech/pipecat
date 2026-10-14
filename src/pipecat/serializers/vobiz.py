@@ -21,6 +21,7 @@ from pipecat.frames.frames import (
     InputAudioRawFrame,
     InputDTMFFrame,
     InterruptionFrame,
+    OutputAudioRawFrame,
     OutputTransportMessageFrame,
     OutputTransportMessageUrgentFrame,
 )
@@ -114,6 +115,28 @@ class VobizFrameSerializer(FrameSerializer):
             setup: Configuration object containing setup parameters.
         """
         self._sample_rate = self._params.sample_rate or setup.audio_in_sample_rate
+
+    supports_output_audio_boundary = True
+    """Output resampler state supports explicit guarded owner transitions."""
+
+    async def flush_output_audio(self) -> str | bytes | None:
+        """Encode the preceding owner's PCM filter tail without a provider request.
+
+        The transport retains that original owner through this await and checks
+        it again before sending. Target-rate PCM bypasses further resampling in
+        the existing audio branch; inbound filter state and lifecycle commands
+        are untouched. A second flush returns no already-consumed tail.
+        """
+        tail = await self._output_resampler.flush()
+        if not tail:
+            return None
+        return await self.serialize(
+            OutputAudioRawFrame(audio=tail, sample_rate=self._vobiz_sample_rate, num_channels=1)
+        )
+
+    async def reset_output_audio(self) -> None:
+        """Discard abandoned output tail while preserving the inbound resampler."""
+        await self._output_resampler.reset()
 
     async def serialize(self, frame: Frame) -> str | bytes | None:
         """Serializes a Pipecat frame to Vobiz WebSocket format.

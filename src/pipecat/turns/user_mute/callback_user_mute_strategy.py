@@ -5,14 +5,18 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-"""User mute strategy that delegates mute decisions to an external callback."""
+"""Delegate per-frame mute decisions to a synchronous or awaitable application callback.
+
+The strategy retains the base frame lifecycle before consulting application state.
+It owns no callback resources and propagates predicate errors and cancellation;
+the caller owns any external state or work used to decide whether to mute.
+"""
 
 import inspect
 from collections.abc import Awaitable, Callable
 
 from pipecat.frames.frames import Frame
 from pipecat.turns.user_mute.base_user_mute_strategy import BaseUserMuteStrategy
-
 
 ShouldMuteCallback = Callable[[Frame], bool | Awaitable[bool]]
 
@@ -22,7 +26,8 @@ class CallbackUserMuteStrategy(BaseUserMuteStrategy):
 
     This strategy delegates the mute decision to a callback function provided
     at construction time. The callback is invoked on each frame and should
-    return True if the user should be muted, False otherwise.
+    return True if the user should be muted, False otherwise. Synchronous
+    predicates and predicates returning any awaitable are both supported.
 
     This is useful when the mute logic depends on external state (e.g., the
     current workflow node, bot speaking state, function call execution, etc.)
@@ -45,21 +50,26 @@ class CallbackUserMuteStrategy(BaseUserMuteStrategy):
         """Initialize the callback user mute strategy.
 
         Args:
-            should_mute_callback: A synchronous or awaitable callback that takes a Frame
-                and returns True if the user should be muted, False otherwise.
+            should_mute_callback: Called once per frame after the base hook;
+                returns a Boolean decision immediately or through an awaitable.
+                The caller retains ownership of callback resources and state.
             **kwargs: Additional arguments passed to the base strategy.
         """
         super().__init__(**kwargs)
         self._should_mute_callback = should_mute_callback
 
     async def process_frame(self, frame: Frame) -> bool:
-        """Process an incoming frame.
+        """Run the base frame hook and evaluate the callback's Boolean mute decision.
 
         Args:
             frame: The frame to be processed.
 
         Returns:
             Whether the strategy is muted (True = muted, False = not muted).
+
+        Raises:
+            Exception: Callback errors propagate without inventing a decision.
+                Cancellation also propagates to the caller unchanged.
         """
         await super().process_frame(frame)
         result = self._should_mute_callback(frame)

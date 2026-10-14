@@ -9,13 +9,17 @@
 This module provides a WebRTC transport implementation using aiortc for
 real-time audio and video communication. It supports bidirectional media
 streaming, application messaging, and client connection management.
+Optional output ownership remains private to the native audio queue and is
+checked again after track pacing; it never enters encoded media or messages.
 """
 
 import asyncio
 import fractions
+import inspect
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -40,7 +44,12 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessorSetup
 from pipecat.transports.base_input import BaseInputTransport
-from pipecat.transports.base_output import BaseOutputTransport
+from pipecat.transports.base_output import (
+    AUDIO_OUTPUT_DISCARDED,
+    AudioOutputDiscarded,
+    AudioOutputPolicy,
+    BaseOutputTransport,
+)
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.smallwebrtc.connection import (
     AUDIO_TRANSCEIVER_INDEX,
@@ -96,6 +105,20 @@ class SmallWebRTCCallbacks(BaseModel):
     on_track_status: Callable[[str, bool], Awaitable[None]]
 
 
+@dataclass(frozen=True)
+class _QueuedAudioChunk:
+    """Keep one native ten-millisecond chunk with its original source and completion.
+
+    Each chunk retains the input's existing future so cancellation can discard
+    its remaining bytes. Only the final chunk settles that future normally.
+    """
+
+    audio: bytes
+    future: asyncio.Future[bool | AudioOutputDiscarded]
+    final: bool
+    context: object | None = field(default=None, repr=False)
+
+
 class RawAudioTrack(AudioStreamTrack):
     """Custom audio stream track for WebRTC output.
 
@@ -103,32 +126,61 @@ class RawAudioTrack(AudioStreamTrack):
     supporting queued audio data with proper synchronization.
     """
 
-    def __init__(self, sample_rate: int, auto_silence: bool = True):
+    def __init__(
+        self,
+        sample_rate: int,
+        auto_silence: bool = True,
+        *,
+        context_is_current: Callable[[object | None], bool] | None = None,
+        native_silence_context: Callable[[], object | None] | None = None,
+    ):
         """Initialize the raw audio track.
 
         Args:
             sample_rate: The audio sample rate in Hz.
             auto_silence: If True, emit silence when the queue is empty. If False,
                 wait until audio data is available.
+            context_is_current: Optional synchronous guard for the retained source.
+            native_silence_context: Paired callback capturing the actual silence
+                producer before pacing. Silence cannot inherit a speech source.
+
+        Raises:
+            ValueError: If guarded callbacks are incomplete or noncallable.
         """
         super().__init__()
+        if (context_is_current is None) != (native_silence_context is None) or (
+            context_is_current is not None
+            and any(
+                not callable(callback)
+                or inspect.iscoroutinefunction(callback)
+                or inspect.iscoroutinefunction(getattr(callback, "__call__", None))
+                for callback in (context_is_current, native_silence_context)
+            )
+        ):
+            raise ValueError("Guarded audio tracks require paired synchronous callbacks")
         self._sample_rate = sample_rate
         self._auto_silence = auto_silence
+        self._context_is_current = context_is_current
+        self._native_silence_context = native_silence_context
         self._samples_per_10ms = sample_rate * 10 // 1000
         self._bytes_per_10ms = self._samples_per_10ms * 2  # 16-bit (2 bytes per sample)
         self._timestamp = 0
         self._start = time.time()
-        # Queue of (bytes, future), broken into 10ms sub chunks as needed
-        self._chunk_queue = deque()
+        self._chunk_queue: deque[_QueuedAudioChunk] = deque()
 
-    def add_audio_bytes(self, audio_bytes: bytes):
+    def add_audio_bytes(
+        self, audio_bytes: bytes, *, context: object | None = None
+    ) -> asyncio.Future[bool | AudioOutputDiscarded]:
         """Add audio bytes to the buffer for transmission.
 
         Args:
             audio_bytes: Raw audio data to queue for transmission.
+            context: Original opaque source captured by the writer, never a
+                replacement inferred when these bytes are consumed.
 
         Returns:
-            A Future that completes when the data is processed.
+            The input's completion future. Guarded discarded data resolves to
+            AUDIO_OUTPUT_DISCARDED; ordinary completion retains True.
 
         Raises:
             ValueError: If audio bytes are not a multiple of 10ms size.
@@ -136,13 +188,20 @@ class RawAudioTrack(AudioStreamTrack):
         if len(audio_bytes) % self._bytes_per_10ms != 0:
             raise ValueError("Audio bytes must be a multiple of 10ms size.")
         future = asyncio.get_running_loop().create_future()
+        if not audio_bytes:
+            future.set_result(True)
+            return future
+        if self.readyState == "ended":
+            future.set_result(
+                AUDIO_OUTPUT_DISCARDED if self._context_is_current is not None else True
+            )
+            return future
 
         # Break input into 10ms chunks
         for i in range(0, len(audio_bytes), self._bytes_per_10ms):
             chunk = audio_bytes[i : i + self._bytes_per_10ms]
-            # Only the last chunk carries the future to be resolved once fully consumed
-            fut = future if i + self._bytes_per_10ms >= len(audio_bytes) else None
-            self._chunk_queue.append((chunk, fut))
+            final = i + self._bytes_per_10ms >= len(audio_bytes)
+            self._chunk_queue.append(_QueuedAudioChunk(chunk, future, final, context))
 
         return future
 
@@ -155,10 +214,30 @@ class RawAudioTrack(AudioStreamTrack):
         logger.debug(
             f"RawAudioTrack.mark_pending_futures_done: marking futures as done, queue size: {len(self._chunk_queue)}"
         )
-        for _, future in self._chunk_queue:
-            if future and not future.done():
-                future.set_result(True)
+        result = AUDIO_OUTPUT_DISCARDED if self._context_is_current is not None else True
+        for chunk in self._chunk_queue:
+            if chunk.final and not chunk.future.done():
+                chunk.future.set_result(result)
         self._chunk_queue.clear()
+
+    def stop(self):
+        """Release queued completion futures before ending the native media track."""
+        self.mark_pending_futures_done()
+        super().stop()
+
+    def _source_is_current(self, context: object | None) -> bool:
+        """Apply a synchronous source guard; callback errors cannot permit audio."""
+        if self._context_is_current is None:
+            return True
+        try:
+            return self._context_is_current(context) is True
+        except Exception:
+            return False
+
+    def _settle_chunk(self, chunk: _QueuedAudioChunk, result: bool | AudioOutputDiscarded):
+        """Settle the original terminal future once, including cancelled writers."""
+        if chunk.final and not chunk.future.done():
+            chunk.future.set_result(result)
 
     async def recv(self):
         """Return the next audio frame for WebRTC transmission.
@@ -167,36 +246,61 @@ class RawAudioTrack(AudioStreamTrack):
             An AudioFrame containing the next audio data, or silence if the queue is empty
             and ``auto_silence`` is True.
         """
-        # Compute required wait time for synchronization
+        if self.readyState == "ended":
+            raise MediaStreamError
+        silence_context = None
+        if self._auto_silence and self._native_silence_context is not None:
+            try:
+                silence_context = self._native_silence_context()
+            except Exception:
+                self.stop()
+                raise MediaStreamError from None
+
+        # Capture the native silence source before this clock wait, independently
+        # from any speech that may later be discarded from the same queue.
         if self._timestamp > 0:
             wait = self._start + (self._timestamp / self._sample_rate) - time.time()
             if wait > 0:
                 await asyncio.sleep(wait)
 
-        if not self._chunk_queue:
-            if self._auto_silence:
+        while True:
+            queued = None
+            if self.readyState == "ended":
+                raise MediaStreamError
+            if self._chunk_queue:
+                candidate = self._chunk_queue.popleft()
+                if self._context_is_current is not None and (
+                    candidate.future.cancelled() or not self._source_is_current(candidate.context)
+                ):
+                    self._settle_chunk(candidate, AUDIO_OUTPUT_DISCARDED)
+                    continue
+                queued = candidate
+                chunk = candidate.audio
+            elif self._auto_silence:
+                if not self._source_is_current(silence_context):
+                    self.stop()
+                    raise MediaStreamError
                 chunk = bytes(self._bytes_per_10ms)
             else:
-                while not self._chunk_queue:
-                    await asyncio.sleep(0.005)
-                chunk, future = self._chunk_queue.popleft()
-                if future and not future.done():
-                    future.set_result(True)
-        else:
-            chunk, future = self._chunk_queue.popleft()
-            if future and not future.done():
-                future.set_result(True)
+                await asyncio.sleep(0.005)
+                continue
 
-        # Convert the byte data to an ndarray of int16 samples
-        samples = np.frombuffer(chunk, dtype=np.int16)
-
-        # Create AudioFrame
-        frame = AudioFrame.from_ndarray(samples[None, :], layout="mono")
-        frame.sample_rate = self._sample_rate
-        frame.pts = self._timestamp
-        frame.time_base = fractions.Fraction(1, self._sample_rate)
-        self._timestamp += self._samples_per_10ms
-        return frame
+            samples = np.frombuffer(chunk, dtype=np.int16)
+            frame = AudioFrame.from_ndarray(samples[None, :], layout="mono")
+            frame.sample_rate = self._sample_rate
+            frame.pts = self._timestamp
+            frame.time_base = fractions.Fraction(1, self._sample_rate)
+            # No await occurs between the final source check and returning to aiortc.
+            if queued is not None:
+                if not self._source_is_current(queued.context):
+                    self._settle_chunk(queued, AUDIO_OUTPUT_DISCARDED)
+                    continue
+                self._settle_chunk(queued, True)
+            elif not self._source_is_current(silence_context):
+                self.stop()
+                raise MediaStreamError
+            self._timestamp += self._samples_per_10ms
+            return frame
 
 
 class RawVideoTrack(VideoStreamTrack):
@@ -266,6 +370,9 @@ class SmallWebRTCClient:
 
         self._audio_output_track = None
         self._video_output_track = None
+        self._audio_output_capture: Callable[[Frame], object | None] | None = None
+        self._audio_output_context_is_current: Callable[[object | None], bool] | None = None
+        self._audio_output_native_context: Callable[[str, str | None], object | None] | None = None
         self._audio_input_track: SmallWebRTCTrack | None = None
         self._video_input_track: SmallWebRTCTrack | None = None
         self._screen_video_track: SmallWebRTCTrack | None = None
@@ -504,17 +611,62 @@ class SmallWebRTCClient:
 
             del frame  # free original AudioFrame
 
-    async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
+    def set_audio_output_callbacks(
+        self,
+        capture: Callable[[Frame], object | None],
+        is_current: Callable[[object | None], bool],
+        native_context: Callable[[str, str | None], object | None],
+    ) -> None:
+        """Bind one output owner's callbacks before the shared client is set up.
+
+        The native track receives these fixed callbacks, never a mutable current
+        agent lookup. Replacing a callback after audio resources exist is denied.
+        """
+        if self._params is not None or self._audio_output_track is not None:
+            raise RuntimeError("Audio output callbacks must be installed before client setup")
+        if any(
+            not callable(callback)
+            or inspect.iscoroutinefunction(callback)
+            or inspect.iscoroutinefunction(getattr(callback, "__call__", None))
+            for callback in (capture, is_current, native_context)
+        ):
+            raise TypeError("Audio output callbacks must be synchronous callables")
+        if self._audio_output_capture is not None and (
+            self._audio_output_capture != capture
+            or self._audio_output_context_is_current != is_current
+            or self._audio_output_native_context != native_context
+        ):
+            raise RuntimeError("Audio output callbacks cannot be replaced")
+        self._audio_output_capture = capture
+        self._audio_output_context_is_current = is_current
+        self._audio_output_native_context = native_context
+
+    async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool | AudioOutputDiscarded:
         """Write an audio frame to the WebRTC connection.
 
         Args:
             frame: The audio frame to transmit.
 
         Returns:
-            True if the audio frame was written successfully, False otherwise.
+            True after ordinary/current track completion, AUDIO_OUTPUT_DISCARDED
+            for an intentional guarded discard, or False for an unavailable sink.
         """
+        context = None
+        if self._audio_output_capture is not None:
+            context = self._audio_output_capture(frame)
+            if not self._audio_output_context_is_current(context):
+                return AUDIO_OUTPUT_DISCARDED
         if self._can_send() and self._audio_output_track:
-            await self._audio_output_track.add_audio_bytes(frame.audio)
+            if self._audio_output_capture is None:
+                await self._audio_output_track.add_audio_bytes(frame.audio)
+                return True
+            if not isinstance(self._audio_output_track, RawAudioTrack) or (
+                self._audio_output_track._context_is_current is None
+            ):
+                raise RuntimeError("WebRTC output track does not support guarded audio")
+            result = await self._audio_output_track.add_audio_bytes(frame.audio, context=context)
+            if result is AUDIO_OUTPUT_DISCARDED:
+                return AUDIO_OUTPUT_DISCARDED
             return True
         return False
 
@@ -599,9 +751,23 @@ class SmallWebRTCClient:
         self._video_input_track = self._webrtc_connection.video_input_track()
         self._screen_video_track = self._webrtc_connection.screen_video_input_track()
         if self._params.audio_out_enabled:
+            if self._audio_output_track is not None:
+                self._audio_output_track.stop()
+            track_callbacks = {}
+            if self._audio_output_capture is not None:
+                guard = self._audio_output_context_is_current
+                native_context = self._audio_output_native_context
+                if guard is None or native_context is None:
+                    raise RuntimeError("WebRTC output callbacks are incomplete")
+                track_callbacks = {
+                    "context_is_current": guard,
+                    # Bind the original output callback, independent of later client references.
+                    "native_silence_context": lambda: native_context("track_silence", None),
+                }
             self._audio_output_track = RawAudioTrack(
                 sample_rate=self._out_sample_rate,
                 auto_silence=self._params.audio_out_auto_silence,
+                **track_callbacks,
             )
             self._webrtc_connection.replace_audio_track(self._audio_output_track)
 
@@ -614,7 +780,9 @@ class SmallWebRTCClient:
         await self._callbacks.on_client_connected(self._webrtc_connection)
 
     async def _handle_peer_disconnected(self):
-        """Handle peer disconnection cleanup."""
+        """Settle the old track's queued writers before discarding media references."""
+        if self._audio_output_track is not None:
+            self._audio_output_track.stop()
         self._audio_input_track = None
         self._video_input_track = None
         self._screen_video_track = None
@@ -625,7 +793,7 @@ class SmallWebRTCClient:
         """Handle client connection closure."""
         # Set pending futures before clearing the track to unblock write_audio_frame
         if self._audio_output_track:
-            self._audio_output_track.mark_pending_futures_done()
+            self._audio_output_track.stop()
 
         self._audio_input_track = None
         self._video_input_track = None
@@ -957,6 +1125,41 @@ class SmallWebRTCOutputTransport(BaseOutputTransport):
         self._client = client
         self._params = params
 
+    def validate_audio_output_policy(self, policy: AudioOutputPolicy | None = None) -> None:
+        """Preflight the actual maintained client/track path without creating media.
+
+        Guarded output requires the native writer and paired track callbacks.
+        Custom writer overrides must explicitly implement their own capability
+        contract rather than inheriting this approval accidentally.
+        """
+        super().validate_audio_output_policy(policy)
+        if (
+            type(self).write_audio_frame is not SmallWebRTCOutputTransport.write_audio_frame
+            or not isinstance(self._client, SmallWebRTCClient)
+            or type(self._client).write_audio_frame is not SmallWebRTCClient.write_audio_frame
+            or type(self._client).set_audio_output_callbacks
+            is not SmallWebRTCClient.set_audio_output_callbacks
+            or type(self._client)._handle_client_connected
+            is not SmallWebRTCClient._handle_client_connected
+        ):
+            raise ValueError("WebRTC transport does not support guarded audio output")
+        track = self._client._audio_output_track
+        if track is not None and (
+            not isinstance(track, RawAudioTrack) or track._context_is_current is None
+        ):
+            raise ValueError("Existing WebRTC track does not support guarded audio output")
+        if policy is not None and self._client._params is not None:
+            raise RuntimeError("Audio output policy must be installed before client setup")
+
+    def set_audio_output_policy(self, policy: AudioOutputPolicy) -> None:
+        """Install the shared policy and fixed native callbacks before client setup."""
+        super().set_audio_output_policy(policy)
+        self._client.set_audio_output_callbacks(
+            self.capture_audio_output_context,
+            self.audio_output_context_is_current,
+            self.native_audio_output_context,
+        )
+
     async def setup(self, setup: FrameProcessorSetup):
         """Set up the transport and establish the WebRTC connection.
 
@@ -1019,14 +1222,15 @@ class SmallWebRTCOutputTransport(BaseOutputTransport):
         """
         await self._client.send_message(frame)
 
-    async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
+    async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool | AudioOutputDiscarded:
         """Write an audio frame to the WebRTC connection.
 
         Args:
             frame: The output audio frame to transmit.
 
         Returns:
-            True if the audio frame was written successfully, False otherwise.
+            The client's current/ordinary completion, deliberate-discard sentinel,
+            or False for an actual unavailable sink.
         """
         return await self._client.write_audio_frame(frame)
 

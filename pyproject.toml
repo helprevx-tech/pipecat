@@ -201,6 +201,8 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "pipecat" = ["py.typed"]
+# Tagless archives need an explicit rule because Git's tracked-file list is unavailable.
+"pipecat.flows" = ["flow_config.schema.json"]
 "pipecat.audio.dtmf" = [
     "dtmf-0.wav",
     "dtmf-1.wav",
