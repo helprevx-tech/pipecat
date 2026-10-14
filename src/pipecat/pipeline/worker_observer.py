@@ -124,8 +124,13 @@ class WorkerObserver(BaseObserver):
             proxy = self._proxies[observer]
             # Remove the proxy so it doesn't get called anymore.
             del self._proxies[observer]
-            # Cancel the proxy worker right away.
-            await self.cancel_task(proxy.task)
+            # Cancel the proxy worker right away. An observer removing itself
+            # runs on that worker, which can't be cancelled from inside, so
+            # the worker ends itself instead.
+            if proxy.task is not asyncio.current_task():
+                await self.cancel_task(proxy.task)
+            # Shutdown only cleans up the observers in _proxies.
+            await observer.cleanup()
 
         # Remove the observer from the list.
         if observer in self._observers:
@@ -160,7 +165,11 @@ class WorkerObserver(BaseObserver):
             raise ObserverProcessingError("; ".join(failures))
 
     async def cleanup(self):
-        """Cleanup all proxy observers."""
+        """Cleanup all proxy observers.
+
+        Tearing down is best effort: an observer that raises is logged and the
+        rest are still cleaned up.
+        """
         await super().cleanup()
 
         if not self._proxies:
@@ -170,7 +179,10 @@ class WorkerObserver(BaseObserver):
             await self.cancel_task(proxy.task)
 
         for observer in self._proxies:
-            await observer.cleanup()
+            try:
+                await observer.cleanup()
+            except Exception as e:
+                logger.error(f"Error cleaning up {observer}: {e}")
 
     async def on_pipeline_started(self):
         """Forward pipeline started signal to all managed observers."""
@@ -294,6 +306,9 @@ class WorkerObserver(BaseObserver):
                     self._record_proxy_error(proxy, f"processing failed ({type(exc).__name__})")
                 finally:
                     queue.task_done()
+                # Self-removal ends this worker while retaining the artifact drain guard.
+                if not self._proxies or self._proxies.get(observer) is not proxy:
+                    break
         finally:
             # Cancellation may leave queued events with no consumer. Release
             # joiners and report the loss rather than leaving finalization stuck.

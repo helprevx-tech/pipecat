@@ -31,7 +31,6 @@ from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.adapters.services.gemini_live_adapter import GeminiLiveLLMAdapter
 from pipecat.frames.frames import (
-    AggregationType,
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     CancelFrame,
@@ -53,6 +52,7 @@ from pipecat.frames.frames import (
     LLMThoughtStartFrame,
     LLMThoughtTextFrame,
     SpeechControlParamsFrame,
+    TextType,
     TranscriptionFrame,
     TTSAudioRawFrame,
     TTSStartedFrame,
@@ -344,20 +344,20 @@ class InputParams(BaseModel):
         context_window_compression: Context compression settings. Defaults to None.
         thinking: Thinking settings. Defaults to None.
             Note that these settings may require specifying a model that
-            supports them, e.g. "gemini-2.5-flash-native-audio-preview-12-2025".
+            supports them, e.g. "gemini-3.8-live".
             Live thinking models require a ``thinking_level``; when none is
             set, the service applies the lowest level the model accepts.
         enable_affective_dialog: Enable affective dialog, which allows Gemini
             to adapt to expression and tone. Defaults to None.
             Note that these settings may require specifying a model that
-            supports them, e.g. "gemini-2.5-flash-native-audio-preview-12-2025".
+            supports them, e.g. "gemini-3.8-live".
             Also note that this setting may require specifying an API version that
             supports it, e.g. HttpOptions(api_version="v1alpha").
         proactivity: Proactivity settings, which allows Gemini to proactively
             decide how to behave, such as whether to avoid responding to
             content that is not relevant. Defaults to None.
             Note that these settings may require specifying a model that
-            supports them, e.g. "gemini-2.5-flash-native-audio-preview-12-2025".
+            supports them, e.g. "gemini-3.8-live".
             Also note that this setting may require specifying an API version that
             supports it, e.g. HttpOptions(api_version="v1alpha").
         extra: Additional parameters. Defaults to empty dict.
@@ -2587,7 +2587,7 @@ class GeminiLiveLLMService(LLMService[GeminiLiveLLMAdapter]):
         await self.push_frame(llm_text_frame)
 
         # Push TTSTextFrame
-        tts_text_frame = TTSTextFrame(text, aggregated_by=AggregationType.SENTENCE)
+        tts_text_frame = TTSTextFrame(text, text_type=TextType.SENTENCE)
         tts_text_frame.includes_inter_frame_spaces = True
         await self.push_frame(tts_text_frame)
 
