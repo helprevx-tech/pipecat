@@ -37,7 +37,6 @@ from pipecat.frames.frames import (
     FunctionCallInProgressFrame,
     FunctionCallResultFrame,
     FunctionCallsStartedFrame,
-    InputAudioRawFrame,
     InterimTranscriptionFrame,
     InterruptionFrame,
     LLMAssistantPushAggregationFrame,
@@ -144,6 +143,8 @@ class LLMUserAggregatorParams:
             mic mid-speech). Set to 0 to disable. Defaults to 1.0.
         user_turn_strategies: User turn start and stop strategies.
         user_mute_strategies: List of user mute strategies.
+        should_interrupt: Optional synchronous policy allowing interruption at
+            turn start. Returning False preserves turn detection and transcripts.
         user_turn_stop_timeout: Time in seconds to wait before considering the
             user's turn finished.
         user_idle_timeout: Timeout in seconds for detecting user idle state.
@@ -181,6 +182,7 @@ class LLMUserAggregatorParams:
     audio_idle_timeout: float = 1.0
     user_turn_strategies: UserTurnStrategies | None = None
     user_mute_strategies: list[BaseUserMuteStrategy] = field(default_factory=list)
+    should_interrupt: Callable[[], bool] | None = None
     user_turn_stop_timeout: float = 5.0
     user_idle_timeout: float = 0
     vad_analyzer: VADAnalyzer | None = None
@@ -240,6 +242,8 @@ class LLMAssistantAggregatorParams:
             (LLM-specific) tools are ignored. When using
             ``LLMContextAggregatorPair``, prefer setting this via its
             ``add_tool_change_messages`` argument instead. Defaults to False.
+        correct_aggregation_callback: Optional callback to correct corrupted
+            TTS text before it's added to the conversation context.
         enable_context_summarization: Legacy field name.
 
             .. deprecated:: 1.2.0
@@ -261,9 +265,6 @@ class LLMAssistantAggregatorParams:
     # ``.. deprecated::`` directives in the class docstring above.
     enable_context_summarization: bool | None = None
     context_summarization_config: LLMContextSummarizationConfig | None = None
-    # Optional hook applied to the assistant turn text right before it is added
-    # to the context. Lets the application correct a corrupted aggregation
-    # (e.g. against the reference text it asked TTS to speak).
     correct_aggregation_callback: Callable[[str], str] | None = None
 
     def __post_init__(self):
@@ -786,6 +787,11 @@ class LLMUserAggregator(LLMContextAggregator):
             self._vad_controller.add_event_handler("on_push_frame", self._on_push_frame)
             self._vad_controller.add_event_handler("on_broadcast_frame", self._on_broadcast_frame)
 
+    @property
+    def user_turn_controller(self) -> UserTurnController:
+        """The turn controller, including its runtime strategy update API."""
+        return self._user_turn_controller
+
     async def setup(self, setup: FrameProcessorSetup):
         """Set up the aggregator.
 
@@ -843,8 +849,6 @@ class LLMUserAggregator(LLMContextAggregator):
             await self.push_frame(frame, direction)
         elif isinstance(frame, TranscriptionFrame):
             await self._handle_transcription(frame)
-        elif isinstance(frame, NodeTransitionStartedFrame):
-            await self._handle_node_transition_started(frame)
         elif isinstance(
             frame,
             (
@@ -881,6 +885,12 @@ class LLMUserAggregator(LLMContextAggregator):
             await self.push_frame(frame, direction)
         elif isinstance(frame, LLMSetToolChoiceFrame):
             self.set_tool_choice(frame.tool_choice)
+        elif isinstance(frame, NodeTransitionStartedFrame):
+            await self.push_frame(frame, direction)
+            await self._handle_node_transition_started(frame)
+        elif isinstance(frame, FunctionCallsStartedFrame):
+            await self.push_frame(frame, direction)
+            await self._handle_function_calls_started(frame)
         elif isinstance(frame, ServiceMetadataFrame):
             await self._handle_service_metadata(frame)
             await self.push_frame(frame, direction)
@@ -906,12 +916,6 @@ class LLMUserAggregator(LLMContextAggregator):
     async def push_aggregation(self) -> str:
         """Push the current aggregation."""
         return await self._push_aggregation()
-
-    async def _handle_node_transition_started(self, frame: NodeTransitionStartedFrame):
-        """Commit without starting inference on the connection being replaced."""
-        await self._cancel_realtime_handoff_flush_task()
-        await self._push_aggregation(run_llm=False)
-        frame.context_aggregation_event.set()
 
     async def _push_aggregation(self, *, run_llm: bool = True) -> str:
         """Write the aggregated user turn to the context.
@@ -1239,7 +1243,6 @@ class LLMUserAggregator(LLMContextAggregator):
                 ProposedUserStoppedSpeakingFrame,
                 UserStartedSpeakingFrame,
                 UserStoppedSpeakingFrame,
-                InputAudioRawFrame,
                 InterimTranscriptionFrame,
                 TranscriptionFrame,
                 EagerTranscriptionFrame,
@@ -1284,6 +1287,32 @@ class LLMUserAggregator(LLMContextAggregator):
         self.transform_messages(frame.transform)
         if frame.run_llm:
             await self.push_context_frame()
+
+    async def _handle_function_calls_started(self, frame: FunctionCallsStartedFrame):
+        if not self._user_turn_controller.has_active_user_turn:
+            return
+
+        logger.info(f"{self}: Function call started while user turn is active, forcing stop.")
+
+        segment = self.aggregation_string()
+        if segment:
+            if self._full_user_turn_aggregation:
+                self._full_user_turn_aggregation = (
+                    f"{self._full_user_turn_aggregation} {segment}".strip()
+                )
+            else:
+                self._full_user_turn_aggregation = segment
+            await self.reset()
+
+        await self._user_turn_controller.force_user_turn_stop()
+
+    async def _handle_node_transition_started(self, frame: NodeTransitionStartedFrame):
+        """Commit pending user text before acknowledging a node handoff."""
+        if not frame.context_aggregation_event:
+            return
+        await self._cancel_realtime_handoff_flush_task()
+        await self._push_aggregation(run_llm=False)
+        frame.context_aggregation_event.set()
 
     async def _handle_transcription(self, frame: TranscriptionFrame):
         text = frame.text
@@ -1364,18 +1393,28 @@ class LLMUserAggregator(LLMContextAggregator):
         self._user_turn_start_timestamp = time_now_iso8601()
         self._full_user_turn_aggregation = None
 
+        interruptions_allowed = (
+            self._params.should_interrupt is None or self._params.should_interrupt()
+        )
+
         # Unless the bot is waiting for the user, it's thinking, speaking or
         # running a function call, and the interruption below cancels that.
         self._user_turn_interrupted_bot = (
-            params.enable_interruptions and not self._user_idle_controller.waiting_for_user
+            params.enable_interruptions
+            and interruptions_allowed
+            and not self._user_idle_controller.waiting_for_user
         )
 
         if params.enable_user_speaking_frames:
-            await self.broadcast_frame(UserStartedSpeakingFrame)
+            await self.broadcast_frame(
+                UserStartedSpeakingFrame, enable_interruptions=interruptions_allowed
+            )
 
         await self._user_idle_controller.process_frame(UserStartedSpeakingFrame())
 
-        if params.enable_interruptions:
+        # A strategy may disable its own interruption because the provider
+        # already sent one. The frame carries policy, not that emission detail.
+        if params.enable_interruptions and interruptions_allowed:
             await self.broadcast_interruption()
 
         await self._call_event_handler("on_user_turn_started", strategy)
@@ -1928,11 +1967,13 @@ class LLMAssistantAggregator(LLMContextAggregator):
         aggregation = self.aggregation_string()
         await self.reset()
 
-        correct = self._params.correct_aggregation_callback
-        if correct is not None:
-            aggregation = correct(aggregation)
-
-        self._context.add_message({"role": "assistant", "content": aggregation})
+        if self._params.correct_aggregation_callback:
+            try:
+                aggregation = self._params.correct_aggregation_callback(aggregation)
+            except Exception as e:
+                logger.error(f"Error in aggregation correction callback: {e}")
+        if aggregation:
+            self._context.add_message({"role": "assistant", "content": aggregation})
 
         return aggregation
 

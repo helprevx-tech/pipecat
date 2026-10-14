@@ -60,8 +60,41 @@ from pipecat.services.settings import TTSSettings
 from pipecat.services.tts_service import InterruptibleTTSService, TextAggregationMode, TTSService
 from pipecat.transcriptions.language import Language, resolve_language
 from pipecat.utils.deprecation import deprecated, warn_deprecated
+from pipecat.utils.text.base_text_filter import BaseTextFilter
 from pipecat.utils.tracing.service_decorators import traced_tts
 from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given, is_given
+
+
+class _SpeakableTextFilter(BaseTextFilter):
+    """Drops fragments Sarvam rejects for carrying no target-language characters.
+
+    Sarvam answers ``400 Text must contain at least one character from the
+    allowed languages`` when a request holds only punctuation or symbols.
+    Sentence aggregation strands such fragments as requests of their own — a
+    doubled full stop leaves a lone ``.`` behind — and the rejected request
+    costs that turn a piece of its audio.
+
+    Emptying the text lets the existing empty-text gate in
+    :class:`~pipecat.services.tts_service.TTSService` drop it before a TTS
+    context is opened. That ordering matters: the websocket service pauses frame
+    processing until audio arrives, so a request that can only fail would stall
+    the turn until the pause watchdog gave up.
+
+    ``str.isalnum`` is true for letters and digits in every script, so Devanagari
+    and Latin pass alike and only punctuation, symbols and emoji are removed —
+    none of which carry sound on their own.
+    """
+
+    async def filter(self, text: str) -> str:
+        """Return the text unchanged, or empty when nothing in it can be voiced.
+
+        Args:
+            text: The candidate text.
+
+        Returns:
+            The original text, or an empty string when it holds no letter or digit.
+        """
+        return text if any(character.isalnum() for character in text) else ""
 
 
 class SarvamTTSModel(StrEnum):
@@ -558,6 +591,9 @@ class SarvamHttpTTSService(TTSService):
             **kwargs,
         )
 
+        # Runs after any caller-supplied filter so it judges the final text.
+        self._text_filters = [*self._text_filters, _SpeakableTextFilter()]
+
         self._api_key = api_key
         self._base_url = base_url
         self._session = aiohttp_session
@@ -994,6 +1030,9 @@ class SarvamTTSService(InterruptibleTTSService):
             settings=default_settings,
             **kwargs,
         )
+
+        # Runs after any caller-supplied filter so it judges the final text.
+        self._text_filters = [*self._text_filters, _SpeakableTextFilter()]
 
         # Init-only audio format fields (not runtime-updatable)
         self._speech_sample_rate = str(sample_rate)

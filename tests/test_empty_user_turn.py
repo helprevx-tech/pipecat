@@ -135,6 +135,15 @@ class TestEmptyUserTurn(unittest.IsolatedAsyncioTestCase):
         messages = context.get_messages()
         self.assertEqual(messages[-2], {"role": "assistant", "content": "Where would"})
 
+    async def test_noninterrupting_speech_does_not_request_interruption_recovery(self):
+        context, inferences = await self._run(
+            [*_bot_speaking(), *_empty_turn()],
+            should_interrupt=lambda: False,
+            empty_user_turn=self._config(),
+        )
+        self.assertEqual(_developer_messages(context), [])
+        self.assertEqual(inferences, 1)
+
     async def test_interrupted_before_response_started(self):
         # The previous turn's response hadn't started when the user spoke:
         # nothing was heard, and the interruption cancelled it.

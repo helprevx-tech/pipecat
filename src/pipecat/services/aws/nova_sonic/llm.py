@@ -829,7 +829,12 @@ class AWSNovaSonicLLMService(LLMService[AWSNovaSonicLLMAdapter]):
         # The adapter resolves conflicts between init-provided and
         # context-provided system instructions (preferring init-provided).
         system_instruction = llm_connection_params["system_instruction"]
-        logger.debug(f"Using system instruction: {system_instruction}")
+        preview = (
+            f"{system_instruction[:100]}...{system_instruction[-100:]}"
+            if system_instruction and len(system_instruction) > 200
+            else system_instruction
+        )
+        logger.debug(f"Using system instruction: {preview}")
         if system_instruction:
             await self._send_text_event(text=system_instruction, role=Role.SYSTEM)
 
@@ -1621,9 +1626,8 @@ class AWSNovaSonicLLMService(LLMService[AWSNovaSonicLLMAdapter]):
         # Nova Sonic reports incremental token usage in details.delta, split into
         # speech/text buckets for input and output. We report the delta (not the
         # cumulative details.total) so usage stays incremental per event, matching
-        # the convention of the other speech-to-speech services. Pipecat's
-        # LLMTokenUsage does not separate modalities, so collapse speech + text
-        # into prompt/completion totals.
+        # the convention of the other speech-to-speech services. Audio counts
+        # are subsets of the combined speech + text prompt/completion totals.
         delta = event_json["usageEvent"].get("details", {}).get("delta", {})
         input_tokens = delta.get("input", {})
         output_tokens = delta.get("output", {})
@@ -1636,6 +1640,8 @@ class AWSNovaSonicLLMService(LLMService[AWSNovaSonicLLMAdapter]):
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 total_tokens=prompt_tokens + completion_tokens,
+                input_audio_tokens=input_tokens.get("speechTokens"),
+                output_audio_tokens=output_tokens.get("speechTokens"),
             )
             await self.start_llm_usage_metrics(tokens)
 

@@ -544,16 +544,16 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         if not props.audio:
             props.audio = events.AudioConfiguration()
         if not props.audio.input:
-            props.audio.input = events.AudioInput(
-                format=events.PCMAudioFormat(
-                    rate=cast(events.SUPPORTED_SAMPLE_RATES, input_sample_rate)
-                )
+            props.audio.input = events.AudioInput()
+        if not props.audio.input.format:
+            props.audio.input.format = events.PCMAudioFormat(
+                rate=cast(events.SUPPORTED_SAMPLE_RATES, input_sample_rate)
             )
         if not props.audio.output:
-            props.audio.output = events.AudioOutput(
-                format=events.PCMAudioFormat(
-                    rate=cast(events.SUPPORTED_SAMPLE_RATES, output_sample_rate)
-                )
+            props.audio.output = events.AudioOutput()
+        if not props.audio.output.format:
+            props.audio.output.format = events.PCMAudioFormat(
+                rate=cast(events.SUPPORTED_SAMPLE_RATES, output_sample_rate)
             )
 
     async def setup(self, setup: FrameProcessorSetup):

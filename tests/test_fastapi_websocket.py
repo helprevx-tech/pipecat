@@ -328,6 +328,36 @@ class TestDisconnectCloseTimeout(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(transport._client._ws_close_timeout, 1.25)
 
 
+class TestDisconnectAfterCloseFrameSent(unittest.IsolatedAsyncioTestCase):
+    """``disconnect()`` must not send a second close frame.
+
+    When another server-side path already closed the socket (application state
+    DISCONNECTED while the client has not yet acknowledged), Starlette raises
+    on any further send — the disconnect intent is already fulfilled.
+    """
+
+    async def test_disconnect_skips_close_when_close_frame_already_sent(self):
+        mock_ws = AsyncMock()
+        type(mock_ws).client_state = PropertyMock(return_value=WebSocketState.CONNECTED)
+        type(mock_ws).application_state = PropertyMock(return_value=WebSocketState.DISCONNECTED)
+        mock_ws.close = AsyncMock()
+
+        callbacks = FastAPIWebsocketCallbacks(
+            on_client_connected=AsyncMock(),
+            on_client_disconnected=AsyncMock(),
+            on_session_timeout=AsyncMock(),
+        )
+        client = FastAPIWebsocketClient(mock_ws, callbacks, ws_close_timeout=5.0)
+        client._leave_counter = 1
+
+        await client.disconnect()
+
+        mock_ws.close.assert_not_called()
+        # The transport still owns this close: the receive loop must not report
+        # a client disconnect and the output transport must stop writing.
+        self.assertTrue(client.is_closing)
+
+
 class _CoalescingSerializer(FrameSerializer):
     """Emits one coalesced payload every third frame, buffering the two before it."""
 

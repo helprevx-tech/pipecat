@@ -42,7 +42,7 @@ CALLER_HEADERS = {
     "Speechify-Caller-Version": pipecat_version(),
 }
 
-# Pin the wire contract independently of the workspace default.
+# Pin the API contract independently of the workspace default.
 SPEECHIFY_API_VERSION = "2026-09-30"
 
 SPEECHIFY_DEFAULT_SAMPLE_RATE = 24000
@@ -78,10 +78,9 @@ def _output_format_from_sample_rate(sample_rate: int) -> tuple[str, int]:
     Returns:
         Tuple of (output_format, sample_rate) for Speechify's native 24 kHz PCM.
 
-    Speechify returns 24 kHz PCM from the timestamped streaming endpoint even when
-    ``pcm_16000`` is requested and the response header says 16 kHz. Using the native
-    rate explicitly keeps frame metadata truthful; Pipecat's output transport performs
-    any required resampling to the downstream transport rate.
+    An explicit 24 kHz request keeps synthesis and frame metadata at the same rate.
+    Pipecat's output transport performs any required resampling to the downstream
+    transport rate.
     """
     if sample_rate != SPEECHIFY_DEFAULT_SAMPLE_RATE:
         logger.debug(

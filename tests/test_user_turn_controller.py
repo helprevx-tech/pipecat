@@ -22,6 +22,7 @@ from pipecat.frames.frames import (
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
+from pipecat.turns.types import UserTurnSpeculation
 from pipecat.turns.user_start import (
     BaseUserTurnStartStrategy,
     ExternalUserTurnStartStrategy,
@@ -50,6 +51,43 @@ TRANSCRIPTION_TIMEOUT = 0.1
 class TestUserTurnController(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.task_manager = TaskManager()
+
+    async def test_accepted_sequence_precedes_strategy_and_event_awaits(self):
+        """Accepted state is observable before any turn-start handler can yield."""
+        start = VADUserTurnStartStrategy()
+        controller = UserTurnController(
+            user_turn_strategies=UserTurnStrategies(
+                start=[start], stop=[ExternalUserTurnCompletionStopStrategy()]
+            )
+        )
+        await controller.setup(frame_processor_setup(self.task_manager))
+        await controller.start()
+        reached = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_start():
+            reached.set()
+            await release.wait()
+
+        start.handle_user_turn_started = slow_start
+        pending = asyncio.create_task(controller.process_frame(VADUserStartedSpeakingFrame()))
+        try:
+            await asyncio.wait_for(reached.wait(), 1)
+            self.assertEqual(controller.accepted_user_turn_sequence, 1)
+            # A duplicate during the callback cannot create another acceptance.
+            await controller.process_frame(VADUserStartedSpeakingFrame())
+            self.assertEqual(controller.accepted_user_turn_sequence, 1)
+            release.set()
+            await pending
+            await controller.process_frame(VADUserStoppedSpeakingFrame())
+            await controller.process_frame(UserTurnInferenceCompletedFrame())
+            self.assertEqual(controller.accepted_user_turn_sequence, 1)
+            await controller.process_frame(VADUserStartedSpeakingFrame())
+            self.assertEqual(controller.accepted_user_turn_sequence, 2)
+        finally:
+            release.set()
+            await pending
+            await controller.cleanup()
 
     async def test_completion_dropped_while_user_speaking(self):
         """A completion arriving while the user speaks must not stop the turn.
@@ -151,6 +189,36 @@ class TestUserTurnController(unittest.IsolatedAsyncioTestCase):
                     len(handler.handlers), 1, f"{name} double-registered on {strategy}"
                 )
 
+    async def test_updating_start_strategy_preserves_pending_stop_timer(self):
+        stop = SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=TRANSCRIPTION_TIMEOUT)
+        controller = UserTurnController(
+            user_turn_strategies=UserTurnStrategies(start=[VADUserTurnStartStrategy()], stop=[stop])
+        )
+        await controller.setup(frame_processor_setup(self.task_manager))
+        ended = asyncio.Event()
+
+        @controller.event_handler("on_user_turn_stopped")
+        async def on_stopped(*_):
+            ended.set()
+
+        try:
+            await controller.process_frame(VADUserStartedSpeakingFrame())
+            await controller.process_frame(
+                TranscriptionFrame("Wait please.", "", "", finalized=True)
+            )
+            await controller.process_frame(VADUserStoppedSpeakingFrame())
+            timer = stop._user_speech_timeout_task
+            self.assertIsNotNone(timer)
+
+            await controller.update_strategies(
+                UserTurnStrategies(start=[MinWordsUserTurnStartStrategy(min_words=2)], stop=[stop])
+            )
+            self.assertIs(stop._user_speech_timeout_task, timer)
+            await asyncio.wait_for(ended.wait(), 1)
+            self.assertFalse(controller.has_active_user_turn)
+        finally:
+            await controller.cleanup()
+
     async def test_inference_triggered_fires_alongside_stopped(self):
         """Default strategies fire both inference-triggered and stopped, in order."""
         controller = UserTurnController(
@@ -180,6 +248,59 @@ class TestUserTurnController(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(TRANSCRIPTION_TIMEOUT + 0.1)
 
         self.assertEqual(events, ["inference_triggered", "stopped"])
+
+    async def test_inference_trigger_dropped_while_user_speaking(self):
+        """Inference and finalization wait until the user is no longer speaking."""
+        stop = SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=TRANSCRIPTION_TIMEOUT)
+        controller = UserTurnController(
+            user_turn_strategies=UserTurnStrategies(
+                start=[VADUserTurnStartStrategy()],
+                stop=[stop],
+            )
+        )
+
+        await controller.setup(frame_processor_setup(self.task_manager))
+
+        events: list[str] = []
+
+        @controller.event_handler("on_user_turn_inference_triggered")
+        async def on_user_turn_inference_triggered(controller, strategy, speculation):
+            events.append("inference_triggered")
+
+        @controller.event_handler("on_user_turn_stopped")
+        async def on_user_turn_stopped(controller, strategy, params):
+            events.append("stopped")
+
+        await controller.process_frame(VADUserStartedSpeakingFrame())
+
+        # A stop decision can resolve after the user has resumed speaking.
+        # Neither inference nor finalization should proceed until a fresh
+        # decision arrives after the user falls silent.
+        await stop.trigger_user_turn_stopped()
+        self.assertEqual(events, [])
+
+        await controller.process_frame(VADUserStoppedSpeakingFrame())
+        await stop.trigger_user_turn_stopped()
+        self.assertEqual(events, ["inference_triggered", "stopped"])
+
+        await controller.cleanup()
+
+    async def test_speculative_inference_allowed_while_user_speaking(self):
+        stop = SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=TRANSCRIPTION_TIMEOUT)
+        controller = UserTurnController(
+            user_turn_strategies=UserTurnStrategies(start=[VADUserTurnStartStrategy()], stop=[stop])
+        )
+        await controller.setup(frame_processor_setup(self.task_manager))
+        inferred = AsyncMock()
+        controller.add_event_handler("on_user_turn_inference_triggered", inferred)
+        try:
+            await controller.process_frame(VADUserStartedSpeakingFrame())
+            speculation = UserTurnSpeculation(text="Please look up my account")
+            await stop.trigger_user_turn_inference_triggered(speculation=speculation)
+            inferred.assert_awaited_once_with(controller, stop, speculation)
+            self.assertTrue(controller.has_active_user_turn)
+        finally:
+            await controller.cleanup()
 
     async def test_deferred_wrapper_skips_stopped(self):
         """A deferred() wrapper drops the inner strategy's on_user_turn_stopped event."""
@@ -212,6 +333,34 @@ class TestUserTurnController(unittest.IsolatedAsyncioTestCase):
         # wrapper). Finalization is suppressed, but the controller's
         # stop watchdog eventually fires `stopped`.
         self.assertEqual(events[0], "inference_triggered")
+
+    async def test_force_user_turn_stop_stops_once(self):
+        controller = UserTurnController(
+            user_turn_strategies=UserTurnStrategies(
+                stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=TRANSCRIPTION_TIMEOUT)],
+            )
+        )
+
+        await controller.setup(frame_processor_setup(self.task_manager))
+
+        stop_events: list[object | None] = []
+
+        @controller.event_handler("on_user_turn_stopped")
+        async def on_user_turn_stopped(controller, strategy, params):
+            stop_events.append(strategy)
+
+        await controller.process_frame(VADUserStartedSpeakingFrame())
+        await controller.process_frame(
+            TranscriptionFrame(text="Hello!", user_id="", timestamp="now")
+        )
+
+        await controller.force_user_turn_stop()
+        self.assertEqual(stop_events, [None])
+
+        await controller.process_frame(VADUserStoppedSpeakingFrame())
+        await asyncio.sleep(TRANSCRIPTION_TIMEOUT + 0.1)
+
+        self.assertEqual(stop_events, [None])
 
     async def test_user_turn_start_reset(self):
         controller = UserTurnController(

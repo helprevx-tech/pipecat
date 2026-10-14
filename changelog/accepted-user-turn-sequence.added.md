@@ -1,0 +1,1 @@
+Added `UserTurnController.accepted_user_turn_sequence`, a read-only counter updated before turn-start callbacks run, so workflow steps can reliably distinguish subsequent caller input from delayed events for the current turn.

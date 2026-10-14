@@ -30,6 +30,7 @@ from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     CancelFrame,
+    CancelWorkerFrame,
     EndFrame,
     FilterControlFrame,
     Frame,
@@ -59,7 +60,7 @@ from pipecat.utils.frame_queue import FrameQueue
 from pipecat.utils.time import nanoseconds_to_seconds
 
 BOT_VAD_STOP_SECS = 0.35
-# Only used as a fallback
+# Public compatibility constant used by Tavus; base transports use per-instance settings.
 BOT_VAD_STOP_FALLBACK_SECS = 3
 
 
@@ -131,6 +132,15 @@ class BaseOutputTransport(FrameProcessor):
         return BotCapabilities(
             audio_out=self._params.audio_out_enabled, video_out=self._params.video_out_enabled
         )
+
+    def _should_forward_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
+        """Whether the media sender forwards an accepted audio frame downstream.
+
+        Paced transports forward their accepted audio later, on their own clock.
+        Keep that choice separate from write success so the failure watchdog does
+        not treat accepted, buffered audio as a failed transport write.
+        """
+        return True
 
     async def setup(self, setup: FrameProcessorSetup):
         """Set up the transport.
@@ -565,6 +575,11 @@ class BaseOutputTransport(FrameProcessor):
             # that EndFrame to be processed by the audio and clock tasks. We
             # also need to wait for these tasks before cancelling the video task
             # because it might be still rendering.
+            #
+            # A peer that stopped reading can no longer strand us here: every
+            # write is bounded by `audio_out_write_timeout_secs`, and the first
+            # timeout costs the transport its usability, so whatever is still
+            # queued drains at once instead of paying the bound again.
             if self._audio_task:
                 await self._audio_task
             if self._clock_task:
@@ -599,11 +614,11 @@ class BaseOutputTransport(FrameProcessor):
             finally:
                 self._executor.shutdown(wait=False)
 
-        async def handle_interruptions(self, _: InterruptionFrame):
+        async def handle_interruptions(self, frame: InterruptionFrame):
             """Handle interruption events by restarting tasks and clearing buffers.
 
             Args:
-                _: The start interruption frame (unused).
+                frame: The interruption that stopped playback.
             """
             # Cancel tasks.
             await self._cancel_clock_task()
@@ -626,7 +641,10 @@ class BaseOutputTransport(FrameProcessor):
             self._create_clock_task()
 
             # Let's send a bot stopped speaking if we have to.
-            await self._bot_stopped_speaking()
+            await self._bot_stopped_speaking(
+                interrupted=True,
+                interruption_id=frame.interruption_id,
+            )
 
         async def handle_audio_frame(self, frame: OutputAudioRawFrame):
             """Handle incoming audio frames by buffering and chunking.
@@ -826,7 +844,9 @@ class BaseOutputTransport(FrameProcessor):
             frame.interruptible = not uninterruptible
             await self._audio_queue.put(frame)
 
-        async def _bot_stopped_speaking(self):
+        async def _bot_stopped_speaking(
+            self, *, interrupted: bool = False, interruption_id: int | None = None
+        ):
             """Handle bot stopped speaking event."""
             if not self._bot_speaking:
                 return
@@ -845,9 +865,13 @@ class BaseOutputTransport(FrameProcessor):
                 f"Bot{f' [{self._destination}]' if self._destination else ''} stopped speaking"
             )
 
-            downstream_frame = BotStoppedSpeakingFrame()
+            downstream_frame = BotStoppedSpeakingFrame(
+                interrupted=interrupted, interruption_id=interruption_id
+            )
             downstream_frame.transport_destination = self._destination
-            upstream_frame = BotStoppedSpeakingFrame()
+            upstream_frame = BotStoppedSpeakingFrame(
+                interrupted=interrupted, interruption_id=interruption_id
+            )
             upstream_frame.transport_destination = self._destination
 
             # Setting the siblings id
@@ -989,9 +1013,9 @@ class BaseOutputTransport(FrameProcessor):
                         await asyncio.sleep(0)
 
             if self._mixer:
-                return with_mixer(BOT_VAD_STOP_FALLBACK_SECS)
+                return with_mixer(self._params.bot_vad_stop_secs)
             else:
-                return without_mixer(BOT_VAD_STOP_FALLBACK_SECS)
+                return without_mixer(self._params.bot_vad_stop_secs)
 
         async def _send_silence(self, secs: int):
             if secs <= 0:
@@ -1006,6 +1030,10 @@ class BaseOutputTransport(FrameProcessor):
 
         async def _audio_task_handler(self):
             """Main audio processing task handler."""
+            consecutive_failures = 0
+            max_consecutive_failures = self._params.audio_out_max_consecutive_failures
+            sleep_between_consecutive_failures = self._params.audio_out_sleep_between_failures
+
             async for frame in self._next_frame():
                 # No need to push EndFrame, it's pushed from process_frame().
                 if isinstance(frame, EndFrame):
@@ -1032,9 +1060,54 @@ class BaseOutputTransport(FrameProcessor):
                     logger.error(f"{self} Error writing {frame} to transport: {e}")
                     push_downstream = False
 
+                # Handle write failures
+                if not push_downstream and isinstance(frame, OutputAudioRawFrame):
+                    # A bounded-write timeout already reports a permanent error
+                    # and marks the transport unusable. From that point the
+                    # worker's ProcessorUnusablePolicy owns disposition; drain
+                    # the remaining queue without sleeping or overriding that
+                    # policy with the older fork-level cancellation watchdog.
+                    if not self._transport.is_usable:
+                        continue
+
+                    consecutive_failures += 1
+                    # A hangup produces a burst of these; the first one and the
+                    # cancellation below are enough above DEBUG.
+                    log = logger.warning if consecutive_failures == 1 else logger.debug
+                    log(
+                        f"Failed to write audio frame (consecutive failures: {consecutive_failures}/{max_consecutive_failures})"
+                    )
+
+                    # Break out if we've failed too many times consecutively
+                    if consecutive_failures >= max_consecutive_failures:
+                        logger.warning(
+                            f"Cancelling task after {consecutive_failures} consecutive failures"
+                        )
+
+                        # Send bot stopped speaking frame
+                        await self._bot_stopped_speaking()
+
+                        # This CancelWorkerFrame would be intercepted upstream
+                        # so that we can call end_call_with_reason and dispose
+                        # off the call properly
+                        await self._transport.push_frame(
+                            CancelWorkerFrame(reason="audio_output_write_failed"),
+                            FrameDirection.UPSTREAM,
+                        )
+                        break
+
+                    # Sleep before retrying
+                    await asyncio.sleep(sleep_between_consecutive_failures)
+                elif isinstance(frame, OutputAudioRawFrame):
+                    # Reset counter only after a successful audio write.
+                    consecutive_failures = 0
+
                 # If we were able to send to the transport, push the frame
                 # downstream in case anyone else needs it.
-                if push_downstream:
+                if push_downstream and (
+                    not isinstance(frame, OutputAudioRawFrame)
+                    or self._transport._should_forward_audio_frame(frame)
+                ):
                     await self._transport.push_frame(frame)
 
         async def _internal_write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:

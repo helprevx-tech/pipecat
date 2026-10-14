@@ -167,4 +167,3 @@ async def on_audio_data(buffer, audio, sample_rate, num_channels):
     os.makedirs("recordings", exist_ok=True)
     await save_audio_file(audio, filename, sample_rate, num_channels)
 {% endmacro %}
-

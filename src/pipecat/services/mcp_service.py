@@ -86,7 +86,9 @@ def _error_detail(error: BaseException) -> str:
 
 
 @asynccontextmanager
-async def _streamable_http_transport(params: StreamableHttpParameters):
+async def _streamable_http_transport(
+    params: StreamableHttpParameters, http_client_factory: Callable[..., Any] | None = None
+):
     """Open a streamable-HTTP transport, owning the HTTP client it runs on.
 
     The transport takes its HTTP settings as a prepared client and leaves that
@@ -94,6 +96,10 @@ async def _streamable_http_transport(params: StreamableHttpParameters):
 
     Args:
         params: Connection parameters for the MCP server.
+        http_client_factory: Optional client factory accepting headers and timeout
+            keyword arguments. It must return the SDK's HTTPX or HTTPX2 client
+            family, as an async context manager owned by this transport. The
+            factory controls redirects and network policy.
 
     Yields:
         The transport's streams, read stream first.
@@ -103,14 +109,19 @@ async def _streamable_http_transport(params: StreamableHttpParameters):
     # own module rather than importing a family directly.
     transport_module = sys.modules[streamable_http_client.__module__]
     http = getattr(transport_module, "httpx2", None) or transport_module.httpx
-    async with http.AsyncClient(
-        headers=params.headers,
-        timeout=http.Timeout(
+    client_kwargs = {
+        "headers": params.headers,
+        "timeout": http.Timeout(
             _timeout_seconds(params.timeout), read=_timeout_seconds(params.sse_read_timeout)
         ),
+    }
+    if http_client_factory is None:
         # Matches the client the SDK builds when given none.
-        follow_redirects=True,
-    ) as client:
+        client_kwargs["follow_redirects"] = True
+    factory = http.AsyncClient if http_client_factory is None else http_client_factory
+    async with factory(**client_kwargs) as client:
+        if http_client_factory is not None and not isinstance(client, http.AsyncClient):
+            raise TypeError("http_client_factory must return the MCP SDK's HTTP client family")
         async with streamable_http_client(
             params.url, http_client=client, terminate_on_close=params.terminate_on_close
         ) as streams:
@@ -215,6 +226,7 @@ class MCPClient(BaseObject):
         tools_filter: list[str] | None = None,
         tools_output_filters: dict[str, Callable[[Any], Any]] | None = None,
         tools_arguments: dict[str, dict[str, Any]] | None = None,
+        http_client_factory: Callable[..., Any] | None = None,
         **kwargs,
     ):
         """Initialize the MCP client with server parameters.
@@ -228,6 +240,11 @@ class MCPClient(BaseObject):
                              merged into every call of that tool (overriding any
                              model-supplied values). The fixed parameter names are removed
                              from the advertised tool schema so the LLM never sees them.
+            http_client_factory: Optional factory for a streamable-HTTP transport's
+                HTTPX or HTTPX2 client. Receives headers and timeout keyword arguments and
+                returns an async context manager; the transport closes it on
+                teardown. Must match the SDK's HTTP client family. Not supported
+                with SSE or stdio transports.
             **kwargs: Additional arguments passed to the parent BaseObject.
         """
         super().__init__(**kwargs)
@@ -235,6 +252,7 @@ class MCPClient(BaseObject):
         self._tools_filter = tools_filter
         self._tools_output_filters = tools_output_filters or {}
         self._tools_arguments = tools_arguments or {}
+        self._http_client_factory = http_client_factory
         self._exit_stack: AsyncExitStack | None = None
         self._active_session: ClientSession | None = None
         # One wrapper shared by every tool this client advertises, carrying the
@@ -264,6 +282,10 @@ class MCPClient(BaseObject):
                 f"{self} invalid argument type: `server_params` must be either "
                 "StdioServerParameters, SseServerParameters, or StreamableHttpParameters."
             )
+        if http_client_factory is not None and not isinstance(
+            server_params, StreamableHttpParameters
+        ):
+            raise TypeError("http_client_factory is only supported for streamable HTTP")
 
     async def start(self) -> None:
         """Start a persistent connection to the MCP server.
@@ -341,7 +363,9 @@ class MCPClient(BaseObject):
                 )
             else:  # StreamableHttpParameters (validated in __init__)
                 read_stream, write_stream = await exit_stack.enter_async_context(
-                    _streamable_http_transport(self._server_params)
+                    _streamable_http_transport(
+                        self._server_params, http_client_factory=self._http_client_factory
+                    )
                 )
 
             session = await exit_stack.enter_async_context(ClientSession(read_stream, write_stream))
@@ -650,7 +674,7 @@ class MCPClient(BaseObject):
                 continue
 
             logger.debug(f"Processing tool: {tool_name}")
-            logger.debug(f"Tool description: {tool.description}")
+            logger.trace(f"Tool description: {tool.description}")
 
             try:
                 function_schema = self._convert_mcp_schema_to_pipecat(

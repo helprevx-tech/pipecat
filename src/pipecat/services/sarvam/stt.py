@@ -411,7 +411,10 @@ class SarvamSTTService(STTService):
         # mapping keys compare equal either way.
         language = cast(Language, assert_given(self._settings.language))
         if language:
-            return language_to_sarvam_language(language)
+            # Already a service code: STTService maps through
+            # language_to_service_language on init and on every settings update,
+            # while raw service language codes pass through unchanged.
+            return language
         return self._config.default_language
 
     def can_generate_metrics(self) -> bool:

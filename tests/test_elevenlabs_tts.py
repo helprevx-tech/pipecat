@@ -7,7 +7,6 @@
 """Tests for ElevenLabs TTS alignment handling."""
 
 import json
-import unittest
 from typing import Any
 
 import pytest
@@ -449,10 +448,6 @@ async def test_disconnect_does_not_push_error_when_server_closed_first():
 
     assert errors == []
     assert service._websocket is None
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 def test_v3_language_set_extends_the_v2_5_set():

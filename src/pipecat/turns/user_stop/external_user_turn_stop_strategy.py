@@ -83,6 +83,7 @@ class ExternalUserTurnStopStrategy(BaseUserTurnStopStrategy):
         self._turn_open = False
         self._event = asyncio.Event()
         self._task: asyncio.Task | None = None
+        self._external_stop_received = False
 
     @property
     def resolves_proposed_turn_stop_frames(self) -> bool:
@@ -113,6 +114,7 @@ class ExternalUserTurnStopStrategy(BaseUserTurnStopStrategy):
         self._text = ""
         self._user_speaking = False
         self._seen_interim_results = False
+        self._external_stop_received = False
         self._turn_announced_elsewhere = False
         self._event.clear()
 
@@ -162,11 +164,18 @@ class ExternalUserTurnStopStrategy(BaseUserTurnStopStrategy):
     async def _handle_user_started_speaking(self, *, announced_elsewhere: bool):
         """Handle the external signal that the user is speaking."""
         self._user_speaking = True
+        # Disarm the finalized-transcript fast path: this is a new utterance, so
+        # the previous one's stop signal must not let a late transcript finalize
+        # the turn. The rest of the per-turn state belongs to _reset(), which
+        # runs at real turn boundaries — clearing it here would drop transcript
+        # text a turn is still accumulating across utterances.
+        self._external_stop_received = False
         self._turn_announced_elsewhere = announced_elsewhere
 
     async def _handle_user_stopped_speaking(self, *, announced_elsewhere: bool):
         """Handle the external signal that the user has stopped speaking."""
         self._user_speaking = False
+        self._external_stop_received = True
         self._turn_announced_elsewhere = announced_elsewhere
         await self._maybe_trigger_user_turn_stopped()
 
@@ -178,7 +187,24 @@ class ExternalUserTurnStopStrategy(BaseUserTurnStopStrategy):
         self._text += frame.text
         # We just got a final result, so let's reset interim results.
         self._seen_interim_results = False
-        # Reset aggregation timer.
+
+        # The external stop signal (Proposed/UserStoppedSpeakingFrame) is a
+        # high-priority SystemFrame and can overtake a finalized transcript
+        # that the STT queued first. Once that finalized
+        # transcript arrives, no more transcript chunks are expected for this
+        # utterance, so waiting for the aggregation timeout only adds latency.
+        if (
+            self._wait_for_transcript
+            and self._external_stop_received
+            and not self._user_speaking
+            and frame.finalized
+            and self._text.strip()
+        ):
+            await self._maybe_trigger_user_turn_stopped()
+            return
+
+        # Preserve the debounce for non-finalized transcripts, which may be
+        # followed by additional transcription chunks.
         self._event.set()
 
     async def _task_handler(self):

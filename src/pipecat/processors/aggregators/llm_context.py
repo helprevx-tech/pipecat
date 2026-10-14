@@ -19,15 +19,8 @@ import base64
 import copy
 import io
 from collections.abc import Callable
-from dataclasses import dataclass
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Literal,
-    TypeAlias,
-    cast,
-    overload,
-)
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias, cast, overload
 
 from loguru import logger
 from PIL import Image
@@ -78,10 +71,17 @@ class LLMSpecificMessage:
 
     Enables the use of service-specific message types while maintaining
     compatibility with the universal LLM context format.
+
+    Parameters:
+        llm: Identifier of the LLM adapter that understands this message.
+        message: Provider-specific content.
+        is_metadata: Auxiliary data that is quietly omitted for other LLMs
+            without losing conversation content. The owning LLM still receives it.
     """
 
     llm: str
     message: Any
+    is_metadata: bool = field(default=False, kw_only=True)
 
 
 LLMContextMessage: TypeAlias = LLMStandardMessage | LLMSpecificMessage
@@ -141,6 +141,10 @@ class LLMContext:
         self._messages: list[LLMContextMessage] = messages if messages else []
         self._tools: ToolsSchema | NotGiven = LLMContext._normalize_and_validate_tools(tools)
         self._tool_choice: LLMContextToolChoice | NotGiven = tool_choice
+
+        # Name of the current OTel span. This is useful for downstream tracing
+        # where we want to include the span name in the span.
+        self._otel_span_name = ""
 
     @staticmethod
     def create_image_url_message(
@@ -327,9 +331,9 @@ class LLMContext:
         Args:
             llm_specific_filter: Optional filter to return LLM-specific
                 messages for the given LLM, in addition to the standard
-                messages. If messages end up being filtered, an error will be
-                logged; this is intended to catch accidental use of
-                incompatible LLM-specific messages.
+                messages. Other LLMs' metadata is quietly omitted; filtering
+                incompatible conversation content logs an error. The stored
+                history is never changed.
             truncate_large_values: If True, return deep copies of messages with
                 large values shortened. For standard messages, known binary
                 data (base64-encoded images, audio) is replaced with short
@@ -347,7 +351,12 @@ class LLMContext:
                 for msg in self._messages
                 if not isinstance(msg, LLMSpecificMessage) or msg.llm == llm_specific_filter
             ]
-            if len(messages) < len(self._messages):
+            if any(
+                isinstance(msg, LLMSpecificMessage)
+                and msg.llm != llm_specific_filter
+                and not msg.is_metadata
+                for msg in self._messages
+            ):
                 logger.error(
                     f"Attempted to use incompatible LLMSpecificMessages with LLM '{llm_specific_filter}'."
                 )
@@ -693,3 +702,15 @@ class LLMContext:
                 "In LLMContext, tools must be a ToolsSchema, a list of direct functions / "
                 f"FunctionSchema objects, or NOT_GIVEN. Got type: {type(tools)}",
             )
+
+    def set_otel_span_name(self, span_name: str | None):
+        """Attach the current OTel span name to the context.
+
+        This value is later accessed by the tracing decorators so that span names can
+        include the OTel span name (e.g. `llm-check-user-intent`).
+        """
+        self._otel_span_name = span_name
+
+    def get_otel_span_name(self) -> str | None:
+        """Return the OTel span name previously set with `set_otel_span_name` (if any)."""
+        return self._otel_span_name

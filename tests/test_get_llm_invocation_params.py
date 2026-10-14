@@ -1245,6 +1245,105 @@ class TestGeminiGetLLMInvocationParams(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(params["messages"]), 3)
         self.assertEqual(params["messages"][-1].parts[0].text, "How are you?")
 
+    def _opening_tool_call_messages(self) -> list[LLMStandardMessage]:
+        """A context whose opening turn is a tool call, with its result."""
+        return [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "start_call", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": '{"ok": true}'},
+        ]
+
+    def _part_kinds(self, content: Content) -> list[str]:
+        """Label each part as a function call, function response, or text."""
+        kinds = []
+        for part in content.parts or []:
+            if getattr(part, "function_call", None):
+                kinds.append("function_call")
+            elif getattr(part, "function_response", None):
+                kinds.append("function_response")
+            else:
+                kinds.append("text")
+        return kinds
+
+    async def test_opening_function_call_gets_seeded_user_turn(self):
+        """A function call as the first turn is preceded by a seeded user turn.
+
+        Gemini rejects a function call turn that does not immediately follow a
+        user turn or a function response turn.
+        """
+        context = LLMContext(messages=self._opening_tool_call_messages())
+
+        params = await self.adapter.get_llm_invocation_params(
+            context, system_instruction="You are a helpful agent."
+        )
+
+        messages = params["messages"]
+        self.assertEqual(messages[0].role, "user")
+        self.assertEqual(messages[0].parts[0].text, GeminiLLMAdapter.SEED_USER_TURN_TEXT)
+        self.assertEqual(self._part_kinds(messages[1]), ["function_call"])
+
+    async def test_opening_function_call_seeded_once_conversation_has_text(self):
+        """The seed is applied even after text messages accumulate.
+
+        The opening function call stays at the head of the context for the rest
+        of the conversation, so it needs a predecessor on every request, not
+        just while the context holds nothing but function messages.
+        """
+        messages = self._opening_tool_call_messages() + [
+            {"role": "assistant", "content": "Hi, thanks for calling!"},
+            {"role": "user", "content": "I'd like a table"},
+        ]
+        context = LLMContext(messages=messages)
+
+        params = await self.adapter.get_llm_invocation_params(
+            context, system_instruction="You are a helpful agent."
+        )
+
+        converted = params["messages"]
+        self.assertEqual(converted[0].role, "user")
+        self.assertEqual(converted[0].parts[0].text, GeminiLLMAdapter.SEED_USER_TURN_TEXT)
+        self.assertEqual(self._part_kinds(converted[1]), ["function_call"])
+
+    async def test_function_call_after_user_turn_not_seeded(self):
+        """A function call already preceded by a user turn is left alone."""
+        messages: list[LLMStandardMessage] = [
+            {"role": "assistant", "content": "Hi, thanks for calling!"},
+            {"role": "user", "content": "I'd like a table"},
+        ] + self._opening_tool_call_messages()
+        context = LLMContext(messages=messages)
+
+        params = await self.adapter.get_llm_invocation_params(
+            context, system_instruction="You are a helpful agent."
+        )
+
+        converted = params["messages"]
+        self.assertEqual(converted[0].role, "model")
+        self.assertEqual(self._part_kinds(converted[0]), ["text"])
+        self.assertNotIn(
+            GeminiLLMAdapter.SEED_USER_TURN_TEXT,
+            [p.text for m in converted for p in (m.parts or []) if getattr(p, "text", None)],
+        )
+
+    async def test_text_only_opening_turn_not_seeded(self):
+        """A context that opens with a plain user turn is left alone."""
+        context = LLMContext(messages=[{"role": "user", "content": "Hello"}])
+
+        params = await self.adapter.get_llm_invocation_params(
+            context, system_instruction="You are a helpful agent."
+        )
+
+        converted = params["messages"]
+        self.assertEqual(len(converted), 1)
+        self.assertEqual(converted[0].parts[0].text, "Hello")
+
 
 class TestGeminiLiveGetLLMInvocationParams(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:

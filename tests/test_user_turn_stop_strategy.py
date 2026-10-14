@@ -880,6 +880,77 @@ class TestExternalUserTurnStopStrategy(unittest.IsolatedAsyncioTestCase):
         await strategy.process_frame(UserStoppedSpeakingFrame())
         self.assertTrue(should_start)
 
+    async def test_finalized_transcript_after_external_stop_triggers_immediately(self):
+        """A stop frame overtaking its finalized transcript must not add the debounce."""
+        strategy = ExternalUserTurnStopStrategy(timeout=10.0)
+        stopped = False
+
+        @strategy.event_handler("on_user_turn_stopped")
+        async def on_user_turn_stopped(strategy, params):
+            nonlocal stopped
+            stopped = True
+
+        await strategy.process_frame(UserStartedSpeakingFrame())
+        await strategy.process_frame(
+            InterimTranscriptionFrame(text="How are you?", user_id="cat", timestamp="")
+        )
+        await strategy.process_frame(UserStoppedSpeakingFrame())
+        self.assertFalse(stopped)
+
+        await strategy.process_frame(
+            TranscriptionFrame(
+                text="How are you?",
+                user_id="cat",
+                timestamp="",
+                finalized=True,
+            )
+        )
+        self.assertTrue(stopped)
+
+    async def test_non_finalized_transcript_after_external_stop_keeps_debounce(self):
+        strategy = ExternalUserTurnStopStrategy(timeout=10.0)
+        stopped = False
+
+        @strategy.event_handler("on_user_turn_stopped")
+        async def on_user_turn_stopped(strategy, params):
+            nonlocal stopped
+            stopped = True
+
+        await strategy.process_frame(UserStartedSpeakingFrame())
+        await strategy.process_frame(UserStoppedSpeakingFrame())
+        await strategy.process_frame(
+            TranscriptionFrame(text="First chunk", user_id="cat", timestamp="")
+        )
+
+        self.assertFalse(stopped)
+
+    async def test_new_external_start_clears_pending_stop_before_finalized_transcript(self):
+        strategy = ExternalUserTurnStopStrategy(timeout=10.0)
+        stopped = False
+
+        @strategy.event_handler("on_user_turn_stopped")
+        async def on_user_turn_stopped(strategy, params):
+            nonlocal stopped
+            stopped = True
+
+        await strategy.process_frame(UserStartedSpeakingFrame())
+        await strategy.process_frame(UserStoppedSpeakingFrame())
+        self.assertFalse(stopped)
+
+        # Speech resumed before the delayed finalized transcript arrived. The
+        # previous chunk's external stop must no longer arm the fast path.
+        await strategy.process_frame(UserStartedSpeakingFrame())
+        await strategy.process_frame(
+            TranscriptionFrame(
+                text="How are you?",
+                user_id="cat",
+                timestamp="",
+                finalized=True,
+            )
+        )
+
+        self.assertFalse(stopped)
+
     async def test_proposal_finalizes_with_emission_enabled(self):
         strategy = ExternalUserTurnStopStrategy()
         await strategy.setup(frame_processor_setup(self.task_manager))

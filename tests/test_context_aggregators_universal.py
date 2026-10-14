@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+import asyncio
 import io
 import json
 import unittest
@@ -40,6 +41,7 @@ from pipecat.frames.frames import (
     LLMThoughtEndFrame,
     LLMThoughtStartFrame,
     LLMThoughtTextFrame,
+    NodeTransitionStartedFrame,
     ProposedUserStartedSpeakingFrame,
     ProposedUserStoppedSpeakingFrame,
     SpeechControlParamsFrame,
@@ -491,6 +493,68 @@ class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
             expected_down_frames=expected_down_frames,
         )
 
+    async def test_turn_closes_when_the_transcript_itself_starts_the_turn(self):
+        """A turn started by the final transcript must not flush its own stop proposal.
+
+        A start strategy that waits for a transcript before committing resolves
+        the turn start from a queued frame, so the interruption it broadcasts is
+        a point in the stream rather than a point in time. The
+        ``ProposedUserStoppedSpeakingFrame`` the STT queued right behind that
+        transcript is still in the queue when the flush passes. If it does not
+        survive, ``UserTurnController`` never clears ``_user_speaking`` and the
+        turn stays open forever.
+
+        The aggregation timer is set far longer than the test runs, so the turn
+        can only close from the stop proposal itself.
+        """
+
+        class TurnDetectingSTT(FrameProcessor):
+            """Stands in for an STT whose provider reports turn boundaries.
+
+            Mirrors ``DeepgramFluxSTTService._handle_end_of_turn``: push the
+            final transcript, then propose the stop behind it.
+            """
+
+            async def process_frame(self, frame: Frame, direction: FrameDirection):
+                await super().process_frame(frame, direction)
+                await self.push_frame(frame, direction)
+                if isinstance(frame, ProposedUserStartedSpeakingFrame):
+                    await self.push_frame(
+                        TranscriptionFrame(text="Hello?", user_id="", timestamp="now")
+                    )
+                    await self.broadcast_frame(ProposedUserStoppedSpeakingFrame)
+
+        context = LLMContext()
+        user_aggregator = LLMUserAggregator(
+            context,
+            params=LLMUserAggregatorParams(
+                user_turn_strategies=UserTurnStrategies(
+                    start=[TranscriptionUserTurnStartStrategy()],
+                    stop=[ExternalUserTurnStopStrategy(timeout=30.0)],
+                ),
+                user_turn_stop_timeout=30.0,
+            ),
+        )
+
+        frames_to_send = [
+            ProposedUserStartedSpeakingFrame(),
+            SleepFrame(sleep=0.3),
+        ]
+        expected_down_frames = [
+            # A transcript-gated start strategy does not resolve proposed turn
+            # starts, so the aggregator forwards the proposal down the pipeline.
+            ProposedUserStartedSpeakingFrame,
+            UserStartedSpeakingFrame,
+            InterruptionFrame,
+            LLMContextFrame,
+            UserStoppedSpeakingFrame,
+        ]
+        await run_test(
+            Pipeline([TurnDetectingSTT(), user_aggregator]),
+            frames_to_send=frames_to_send,
+            expected_down_frames=expected_down_frames,
+        )
+
     async def test_proposed_frames_go_unresolved_while_the_user_is_muted(self):
         """Muting gates the proposal, so no turn is decided from it."""
         context = LLMContext()
@@ -773,6 +837,93 @@ class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
 
         # The user mute strategies should have muted the user.
         self.assertFalse(user_turn)
+
+    async def test_function_call_start_force_stops_user_turn_without_llm_rerun(self):
+        context = LLMContext()
+        user_aggregator = LLMUserAggregator(
+            context,
+            params=LLMUserAggregatorParams(
+                user_turn_strategies=UserTurnStrategies(
+                    stop=[
+                        SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=TRANSCRIPTION_TIMEOUT)
+                    ],
+                ),
+            ),
+        )
+
+        stop_messages = []
+
+        @user_aggregator.event_handler("on_user_turn_stopped")
+        async def on_user_turn_stopped(aggregator, strategy, message):
+            stop_messages.append((strategy, message))
+
+        frames_to_send = [
+            VADUserStartedSpeakingFrame(),
+            TranscriptionFrame(text="Hello!", user_id="", timestamp="now"),
+            SleepFrame(),
+            FunctionCallsStartedFrame(
+                function_calls=[
+                    FunctionCallFromLLM(
+                        function_name="fn_1", tool_call_id="1", arguments={}, context=None
+                    )
+                ]
+            ),
+            SleepFrame(),
+            VADUserStoppedSpeakingFrame(),
+            SleepFrame(sleep=TRANSCRIPTION_TIMEOUT + 0.1),
+        ]
+        (down_frames, _) = await run_test(
+            Pipeline([user_aggregator]), frames_to_send=frames_to_send
+        )
+
+        down_frame_types = [type(frame) for frame in down_frames]
+
+        self.assertIn(UserStoppedSpeakingFrame, down_frame_types)
+        self.assertNotIn(LLMContextFrame, down_frame_types)
+        self.assertEqual(len(stop_messages), 1)
+        self.assertIsNone(stop_messages[0][0])
+        self.assertEqual(stop_messages[0][1].content, "Hello!")
+
+    async def test_node_transition_started_commits_pending_transcription(self):
+        context = LLMContext()
+        user_aggregator = LLMUserAggregator(context, _realtime_service_mode=True)
+        context_aggregation_event = asyncio.Event()
+        transition_frame = NodeTransitionStartedFrame(
+            function_calls=[
+                FunctionCallFromLLM(
+                    function_name="move_to_next_node",
+                    tool_call_id="call_1",
+                    arguments={},
+                    context=context,
+                )
+            ],
+            context_aggregation_event=context_aggregation_event,
+        )
+
+        down_frames, _ = await run_test(
+            Pipeline([user_aggregator]),
+            frames_to_send=[
+                TranscriptionFrame(
+                    text="The answer that selected this node",
+                    user_id="",
+                    timestamp="now",
+                ),
+                transition_frame,
+            ],
+        )
+
+        self.assertTrue(context_aggregation_event.is_set())
+        self.assertEqual(
+            context.messages[-1],
+            {
+                "role": "user",
+                "content": "The answer that selected this node",
+            },
+        )
+        self.assertLess(
+            next(i for i, frame in enumerate(down_frames) if frame is transition_frame),
+            next(i for i, frame in enumerate(down_frames) if isinstance(frame, LLMContextFrame)),
+        )
 
     async def test_pending_transcription_emitted_on_end_frame(self):
         """Pending user transcription should be emitted when EndFrame arrives."""

@@ -370,6 +370,12 @@ class PipelineWorker(BaseWorker):
                 manager; otherwise the runner reports dangling tasks.
             clock: Clock implementation for timing operations.
             conversation_id: Optional custom ID for the conversation.
+            conversation_parent_context: Optional OpenTelemetry context whose
+                active span carries a fixed trace id. When provided, the
+                conversation span is created under it instead of as a new root,
+                so multiple pipelines can export into a single shared trace.
+            conversation_type: Value for the ``conversation.type`` span attribute
+                (e.g. ``"voice"`` or ``"text"``).
             enable_rtvi: Whether to automatically add RTVI support to the
                 pipeline. ``None``, the default, adds it unless the pipeline
                 is bridged: a bridged worker has no client of its own, and
@@ -448,8 +454,6 @@ class PipelineWorker(BaseWorker):
         self._start_timeout_secs = start_timeout_secs
         self._clock = clock or SystemClock()
         self._conversation_id = conversation_id
-        # Parent trace context and conversation kind ("voice", "text", ...) handed to
-        # the turn trace observer so a conversation's spans stitch onto their parent.
         self._conversation_parent_context = conversation_parent_context
         self._conversation_type = conversation_type
         self._enable_tracing = enable_tracing and is_tracing_available()
@@ -704,6 +708,15 @@ class PipelineWorker(BaseWorker):
         return self._turn_trace_observer
 
     @property
+    def user_bot_latency_observer(self) -> UserBotLatencyObserver | None:
+        """Get the user-bot latency observer if tracing is enabled.
+
+        Returns:
+            The user-bot latency observer instance or None if not enabled.
+        """
+        return self._user_bot_latency_observer
+
+    @property
     def rtvi(self) -> RTVIProcessor:
         """Get the RTVI processor if RTVI is enabled.
 
@@ -747,6 +760,10 @@ class PipelineWorker(BaseWorker):
             observer: The observer to remove from pipeline monitoring.
         """
         await self._observer.remove_observer(observer)
+
+    async def wait_for_observers(self) -> None:
+        """Wait until observers have processed all frames queued so far."""
+        await self._observer.wait_until_idle()
 
     def set_reached_upstream_filter(self, types: tuple[type[Frame], ...]):
         """Set which frame types trigger the on_frame_reached_upstream event.
@@ -893,7 +910,7 @@ class PipelineWorker(BaseWorker):
                 # Wait for pipeline to finish.
                 await self._wait_for_pipeline_finished()
             except asyncio.CancelledError:
-                logger.debug(f"Pipeline worker {self} got cancelled from outside...")
+                logger.info(f"Pipeline worker {self} got cancelled from outside...")
                 # We have been cancelled from outside, let's just cancel everything.
                 await self._cancel()
                 # Wait again for pipeline to finish. This time we have really

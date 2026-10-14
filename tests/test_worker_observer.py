@@ -13,7 +13,7 @@ import unittest
 from pipecat.frames.frames import TextFrame
 from pipecat.observers.base_observer import BaseObserver, FramePushed
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.worker_observer import WorkerObserver
+from pipecat.pipeline.worker_observer import ObserverProcessingError, WorkerObserver
 from pipecat.processors.filters.identity_filter import IdentityFilter
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.tests.utils import SleepFrame, run_test
@@ -122,5 +122,132 @@ class TestWorkerObserverMemory(unittest.IsolatedAsyncioTestCase):
         await worker_observer.cleanup()
 
 
+class TestObserverArtifactBarrier(unittest.IsolatedAsyncioTestCase):
+    async def test_idle_wait_includes_async_event_handlers(self):
+        finished = asyncio.Event()
+        release = asyncio.Event()
+
+        class EventObserver(BaseObserver):
+            def __init__(self):
+                super().__init__()
+                self._register_event_handler("on_text")
+
+            async def on_push_frame(self, data):
+                await self._call_event_handler("on_text")
+
+        observer = EventObserver()
+
+        @observer.event_handler("on_text")
+        async def persist(_observer):
+            await release.wait()
+            finished.set()
+
+        worker = WorkerObserver(observers=[observer])
+        await worker.setup(TaskManager())
+        source = IdentityFilter()
+        await worker.on_push_frame(
+            FramePushed(
+                source=source,
+                destination=source,
+                frame=TextFrame("hello"),
+                direction=FrameDirection.DOWNSTREAM,
+                timestamp=0,
+            )
+        )
+        barrier = asyncio.create_task(worker.wait_until_idle())
+        await asyncio.sleep(0)
+        self.assertFalse(barrier.done())
+        release.set()
+        await asyncio.wait_for(barrier, 1)
+        self.assertTrue(finished.is_set())
+        await worker.cleanup()
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestObserverFailureRecovery(unittest.IsolatedAsyncioTestCase):
+    def _event(self, text):
+        source = IdentityFilter(name="source")
+        return FramePushed(
+            source=source,
+            destination=source,
+            frame=TextFrame(text),
+            direction=FrameDirection.DOWNSTREAM,
+            timestamp=0,
+        )
+
+    async def test_failed_callback_does_not_strand_later_frames_or_certify_artifacts(self):
+        class Flaky(RecordingObserver):
+            async def on_push_frame(self, data):
+                if data.frame.text == "bad":
+                    raise ValueError("synthetic failure")
+                await super().on_push_frame(data)
+
+        flaky, healthy = Flaky(), RecordingObserver()
+        worker = WorkerObserver(observers=[flaky, healthy])
+        await worker.setup(TaskManager())
+        self.addAsyncCleanup(worker.cleanup)
+        await worker.on_push_frame(self._event("bad"))
+        await worker.on_push_frame(self._event("good"))
+        with self.assertRaisesRegex(ObserverProcessingError, "processing failed"):
+            await asyncio.wait_for(worker.wait_until_idle(), 1)
+        self.assertEqual(len(flaky.pushes), 1)
+        self.assertEqual(len(healthy.pushes), 2)
+        self.assertTrue(all(not proxy.task.done() for proxy in worker._proxies.values()))
+
+    async def test_late_observer_setup_finishes_before_first_frame_and_managed_task(self):
+        class Late(RecordingObserver):
+            async def setup(self, manager):
+                await asyncio.sleep(0.01)
+                await super().setup(manager)
+
+            async def on_push_frame(self, data):
+                await self.create_task(asyncio.sleep(0))
+                await super().on_push_frame(data)
+
+        worker = WorkerObserver()
+        manager = TaskManager()
+        await worker.setup(manager)
+        self.addAsyncCleanup(worker.cleanup)
+        observer = Late()
+        worker.add_observer(observer)
+        await worker.on_push_frame(self._event("immediate"))
+        await asyncio.wait_for(worker.wait_until_idle(), 1)
+        self.assertIs(observer.task_manager, manager)
+        self.assertEqual(len(observer.pushes), 1)
+
+    async def test_late_setup_failure_is_reported_without_hanging_the_barrier(self):
+        class FailedSetup(RecordingObserver):
+            async def setup(self, manager):
+                raise RuntimeError("setup failed")
+
+        worker = WorkerObserver()
+        await worker.setup(TaskManager())
+        self.addAsyncCleanup(worker.cleanup)
+        observer = FailedSetup()
+        worker.add_observer(observer)
+        await worker.on_push_frame(self._event("queued"))
+        with self.assertRaisesRegex(ObserverProcessingError, "setup failed"):
+            await asyncio.wait_for(worker.wait_until_idle(), 1)
+        self.assertEqual(observer.pushes, [])
+
+    async def test_cancelled_processing_releases_backlog_and_reports_incomplete_drain(self):
+        started = asyncio.Event()
+
+        class Blocked(RecordingObserver):
+            async def on_push_frame(self, data):
+                started.set()
+                await asyncio.Event().wait()
+
+        worker = WorkerObserver(observers=[Blocked()])
+        await worker.setup(TaskManager())
+        await worker.on_push_frame(self._event("running"))
+        await started.wait()
+        await worker.on_push_frame(self._event("queued"))
+        await worker.cleanup()
+        # A late push must not enter an orphaned queue after cleanup.
+        await worker.on_push_frame(self._event("after cleanup"))
+        with self.assertRaisesRegex(ObserverProcessingError, "cancelled"):
+            await asyncio.wait_for(worker.wait_until_idle(), 1)

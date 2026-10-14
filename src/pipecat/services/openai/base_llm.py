@@ -35,7 +35,9 @@ from pydantic import BaseModel, Field
 from pipecat.adapters.base_llm_adapter import LLMContextConversionError
 from pipecat.adapters.services.open_ai_adapter import OpenAILLMAdapter, OpenAILLMInvocationParams
 from pipecat.frames.frames import (
+    BotStoppedSpeakingFrame,
     Frame,
+    FunctionCallsFromLLMInfoFrame,
     LLMContextFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
@@ -49,6 +51,7 @@ from pipecat.services.settings import LLMSettings
 from pipecat.utils.deprecation import deprecated
 from pipecat.utils.errors import ErrorCategory
 from pipecat.utils.http import TIMEOUT_EXCEPTIONS, connection_limits
+from pipecat.utils.text.alnum_utils import has_alnum
 from pipecat.utils.tracing.service_decorators import traced_llm
 from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given, is_given
 
@@ -541,6 +544,12 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         arguments = ""
         tool_call_id = ""
 
+        response_generation = self._begin_tool_response()
+
+        # Content generated in the current completion, accumulated so the
+        # deferral decision below can ask whether any of it is speakable.
+        generated_content = ""
+
         await self.start_ttfb_metrics()
 
         # Generate chat completions from LLMContext
@@ -622,6 +631,7 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                             # Keep iterating through the response to collect all the argument fragments
                             arguments += tool_call.function.arguments
                     elif chunk.choices[0].delta.content:
+                        generated_content += chunk.choices[0].delta.content
                         await self._push_llm_text(chunk.choices[0].delta.content)
 
                     # When gpt-4o-audio / gpt-4o-mini-audio is used for llm or stt+llm
@@ -668,7 +678,26 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                     )
                 )
 
-            await self.run_function_calls(function_calls)
+            # Send the info frame with function calls so that it can be traced by service_decorators
+            await self.push_frame(
+                FunctionCallsFromLLMInfoFrame(function_calls=function_calls),
+                direction=FrameDirection.DOWNSTREAM,
+            )
+
+            # Unspeakable content (whitespace, punctuation, markup) never
+            # produces the BotStoppedSpeakingFrame that releases a deferred
+            # transition, so it must not count as generated text.
+            text_generated = has_alnum(generated_content)
+            if generated_content and not text_generated:
+                logger.info(
+                    f"{self}: no speakable content ({generated_content[:120]!r}); "
+                    "running function calls without waiting for TTS"
+                )
+            await self._run_or_defer_function_calls(
+                function_calls,
+                text_generated=text_generated,
+                response_generation=response_generation,
+            )
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Process frames for LLM completion requests.
@@ -681,7 +710,11 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         """
         await super().process_frame(frame, direction)
 
-        if isinstance(frame, LLMContextFrame):
+        # Handle BotStoppedSpeakingFrame to execute pending node-transition calls.
+        if isinstance(frame, BotStoppedSpeakingFrame):
+            await self._run_pending_node_transition_function_calls(frame)
+            await self.push_frame(frame, direction)
+        elif isinstance(frame, LLMContextFrame):
             try:
                 await self.push_frame(LLMFullResponseStartFrame())
                 await self.start_processing_metrics()

@@ -73,6 +73,13 @@ class TransportParams(BaseModel):
         audio_out_end_silence_secs: How much silence to send after an EndFrame (0 for no silence).
         audio_out_auto_silence: Insert silence frames when the audio output queue is empty.
             When False, the transport will wait for audio data instead of inserting silence.
+        audio_out_max_consecutive_failures: Max failure of transport write before givingup
+        audio_out_sleep_between_failures: Sleep interval between subsequent failures
+        bot_vad_stop_secs: Fallback timeout (in seconds) used to mark the bot as
+            stopped speaking when no explicit ``TTSStoppedFrame`` arrives (e.g.
+            for realtime/speech-to-speech LLMs). Lower this for realtime models
+            so bot-stopped-speaking fires promptly after the output queue
+            drains.
         audio_out_write_timeout_secs: How long a single write to the transport may take
             before the peer is considered gone. A client that stops reading leaves the
             write waiting with nothing to fail, so it would otherwise never return.
@@ -121,6 +128,9 @@ class TransportParams(BaseModel):
     audio_out_destinations: list[str] = Field(default_factory=list)
     audio_out_end_silence_secs: int = 2
     audio_out_auto_silence: bool = True
+    audio_out_max_consecutive_failures: int = 10
+    audio_out_sleep_between_failures: float = 0.5
+    bot_vad_stop_secs: float = 3.0
     audio_out_write_timeout_secs: float = 10.0
     audio_in_enabled: bool = False
     audio_in_sample_rate: int | None = None

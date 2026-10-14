@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-"""Tests for interruption handling in :class:`BaseOutputTransport`."""
+"""Tests for BaseOutputTransport behavior."""
 
 import asyncio
 import hashlib
@@ -21,10 +21,12 @@ from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     CancelFrame,
+    CancelWorkerFrame,
     EndFrame,
     FilterControlFrame,
     FilterEnableFrame,
     FilterUpdateSettingsFrame,
+    Frame,
     InterruptionFrame,
     MixerControlFrame,
     OutputAudioRawFrame,
@@ -35,9 +37,116 @@ from pipecat.frames.frames import (
     VolumeGainFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessorSetup
+from pipecat.tests.mock_transport import MockOutputTransport
 from pipecat.transports.base_output import BaseOutputTransport
 from pipecat.transports.base_transport import TransportParams
-from pipecat.utils.asyncio.task_manager import TaskManager
+from pipecat.utils.asyncio.task_manager import TaskManager, TaskManagerParams
+
+
+class CapturingOutputTransport(MockOutputTransport):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.pushed_frames: list[tuple[Frame, FrameDirection]] = []
+
+    async def push_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
+        self.pushed_frames.append((frame, direction))
+
+
+class TestBaseOutputTransportFailures(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.task_manager = TaskManager()
+        self.task_manager.setup(TaskManagerParams(loop=asyncio.get_event_loop()))
+
+    async def test_buffered_success_can_suppress_forwarding_without_triggering_failure_watchdog(
+        self,
+    ):
+        transport = CapturingOutputTransport(
+            TransportParams(
+                audio_out_enabled=True,
+                audio_out_10ms_chunks=1,
+                audio_out_end_silence_secs=0,
+                audio_out_max_consecutive_failures=2,
+                audio_out_sleep_between_failures=0,
+            ),
+            audio_write_succeeds=True,
+        )
+        transport._should_forward_audio_frame = lambda frame: False
+        transport.write_audio_frame = AsyncMock(return_value=True)
+        await transport.setup(
+            FrameProcessorSetup(
+                clock=SystemClock(),
+                task_manager=self.task_manager,
+                pipeline_worker=SimpleNamespace(app_resources=None),
+            )
+        )
+        await transport.process_frame(StartFrame(), FrameDirection.DOWNSTREAM)
+        try:
+            for _ in range(3):
+                await transport.process_frame(
+                    OutputAudioRawFrame(audio=b"\x01\x02" * 240, sample_rate=24000, num_channels=1),
+                    FrameDirection.DOWNSTREAM,
+                )
+            async with asyncio.timeout(1):
+                while transport.write_audio_frame.await_count < 3:
+                    await asyncio.sleep(0.01)
+            self.assertFalse(
+                any(
+                    isinstance(frame, (OutputAudioRawFrame, CancelWorkerFrame))
+                    for frame, _ in transport.pushed_frames
+                )
+            )
+            self.assertTrue(transport.is_usable)
+        finally:
+            await transport.process_frame(CancelFrame(), FrameDirection.DOWNSTREAM)
+            await transport.cleanup()
+
+    async def test_non_audio_frame_does_not_reset_consecutive_audio_write_failures(self):
+        transport = CapturingOutputTransport(
+            TransportParams(
+                audio_out_enabled=True,
+                audio_out_10ms_chunks=1,
+                audio_out_end_silence_secs=0,
+                audio_out_max_consecutive_failures=2,
+                audio_out_sleep_between_failures=0,
+            ),
+            audio_write_succeeds=False,
+        )
+        await transport.setup(
+            FrameProcessorSetup(
+                clock=SystemClock(),
+                task_manager=self.task_manager,
+                pipeline_worker=SimpleNamespace(app_resources=None),  # type: ignore[arg-type]
+            )
+        )
+
+        await transport.process_frame(StartFrame(), FrameDirection.DOWNSTREAM)
+
+        try:
+            audio = b"\x01\x02" * 240
+            await transport.process_frame(
+                OutputAudioRawFrame(audio=audio, sample_rate=24000, num_channels=1),
+                FrameDirection.DOWNSTREAM,
+            )
+            await transport.process_frame(TTSStoppedFrame(), FrameDirection.DOWNSTREAM)
+            await transport.process_frame(
+                OutputAudioRawFrame(audio=audio, sample_rate=24000, num_channels=1),
+                FrameDirection.DOWNSTREAM,
+            )
+
+            for _ in range(20):
+                if any(
+                    isinstance(frame, CancelWorkerFrame) for frame, _ in transport.pushed_frames
+                ):
+                    break
+                await asyncio.sleep(0.01)
+
+            assert any(
+                isinstance(frame, CancelWorkerFrame) and direction == FrameDirection.UPSTREAM
+                for frame, direction in transport.pushed_frames
+            )
+        finally:
+            await transport.process_frame(CancelFrame(), FrameDirection.DOWNSTREAM)
+            await transport.cleanup()
 
 
 class _PassthroughMixer(BaseAudioMixer):
@@ -92,6 +201,7 @@ async def _make_transport(
     audio_out_sample_rate: int | None = None,
     audio_filter: BaseAudioFilter | None = None,
     audio_out_volume: float = 1.0,
+    **param_kwargs,
 ) -> BaseOutputTransport:
     params = TransportParams(
         audio_out_enabled=True,
@@ -99,6 +209,7 @@ async def _make_transport(
         audio_out_filter=audio_filter,
         audio_out_sample_rate=audio_out_sample_rate,
         audio_out_volume=audio_out_volume,
+        **param_kwargs,
     )
     transport = BaseOutputTransport(params)
     transport.push_frame = AsyncMock()
@@ -119,8 +230,56 @@ async def _make_transport(
 
 
 class TestBaseOutputTransportInterruptions(unittest.IsolatedAsyncioTestCase):
-    async def _make_transport(self, mixer: BaseAudioMixer | None = None) -> BaseOutputTransport:
-        return await _make_transport(mixer)
+    async def test_interruption_marks_both_stop_frames_as_interrupted(self):
+        transport = await _make_transport()
+        started = asyncio.Event()
+
+        async def write(_frame):
+            started.set()
+            return True
+
+        transport.write_audio_frame = AsyncMock(side_effect=write)
+        try:
+            sender = transport._media_senders[None]
+            await transport.process_frame(
+                TTSAudioRawFrame(
+                    audio=b"\x01\x02" * (sender.audio_chunk_size // 2),
+                    sample_rate=sender.sample_rate,
+                    num_channels=1,
+                ),
+                FrameDirection.DOWNSTREAM,
+            )
+            await asyncio.wait_for(started.wait(), 1)
+            upstream, interruption = InterruptionFrame(), InterruptionFrame()
+            upstream.broadcast_sibling_id = interruption.id
+            interruption.broadcast_sibling_id = upstream.id
+            await transport.process_frame(interruption, FrameDirection.DOWNSTREAM)
+            stops = [
+                call
+                for call in transport.push_frame.call_args_list
+                if isinstance(call.args[0], BotStoppedSpeakingFrame)
+            ]
+            self.assertEqual(len(stops), 2)
+            self.assertEqual(
+                {
+                    call.args[1]
+                    if len(call.args) > 1
+                    else call.kwargs.get("direction", FrameDirection.DOWNSTREAM)
+                    for call in stops
+                },
+                set(FrameDirection),
+            )
+            self.assertTrue(all(call.args[0].interrupted for call in stops))
+            self.assertTrue(
+                all(getattr(call.args[0], "interruption_id", None) == upstream.id for call in stops)
+            )
+        finally:
+            await transport.cancel(CancelFrame())
+
+    async def _make_transport(
+        self, mixer: BaseAudioMixer | None = None, **param_kwargs
+    ) -> BaseOutputTransport:
+        return await _make_transport(mixer, **param_kwargs)
 
     async def test_interruption_with_mixer_keeps_audio_task_and_mixer_output(self):
         transport = await self._make_transport(mixer=_PassthroughMixer())
@@ -344,6 +503,13 @@ class TestBaseOutputTransportAudioBuffering(unittest.IsolatedAsyncioTestCase):
             pushed_types = [call.args[0].__class__ for call in transport.push_frame.call_args_list]
             self.assertIn(BotStartedSpeakingFrame, pushed_types)
             self.assertIn(BotStoppedSpeakingFrame, pushed_types)
+            self.assertTrue(
+                all(
+                    not call.args[0].interrupted
+                    for call in transport.push_frame.call_args_list
+                    if isinstance(call.args[0], BotStoppedSpeakingFrame)
+                )
+            )
         finally:
             await transport.cancel(CancelFrame())
 
@@ -380,6 +546,32 @@ def _one_second_of_audio() -> OutputAudioRawFrame:
 
 class TestBaseOutputTransportWriteTimeout(unittest.IsolatedAsyncioTestCase):
     """A peer that stops reading blocks the write on buffers that never drain."""
+
+    async def test_timeout_defers_disposition_without_watchdog_sleep_or_cancel(self):
+        """The permanent timeout error owns disposition after 1.8.1."""
+        never_returns = asyncio.Event()
+
+        async def wedged(_frame):
+            await never_returns.wait()
+            return True
+
+        write = AsyncMock(side_effect=wedged)
+        transport = await _make_wedging_transport(write, timeout=0.01)
+
+        await transport.process_frame(_one_second_of_audio(), FrameDirection.DOWNSTREAM)
+        await asyncio.sleep(0.05)
+
+        # The old fork watchdog slept 0.5s between each queued failure and
+        # eventually forced a CancelWorkerFrame. Once the timeout has marked
+        # the transport unusable, the queue should instead drain immediately.
+        await asyncio.wait_for(
+            transport.process_frame(EndFrame(), FrameDirection.DOWNSTREAM), timeout=0.5
+        )
+
+        pushed = [call.args[0] for call in transport.push_frame.call_args_list]
+        self.assertEqual(write.call_count, 1)
+        self.assertFalse(transport.is_usable)
+        self.assertFalse(any(isinstance(frame, CancelWorkerFrame) for frame in pushed))
 
     async def test_end_frame_still_reaches_downstream(self):
         """`process_frame` pushes the EndFrame only after `stop()` returns."""

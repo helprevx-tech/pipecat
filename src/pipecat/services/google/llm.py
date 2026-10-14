@@ -28,7 +28,9 @@ from pipecat.adapters.base_llm_adapter import LLMContextConversionError
 from pipecat.adapters.services.gemini_adapter import GeminiLLMAdapter
 from pipecat.frames.frames import (
     AssistantImageRawFrame,
+    BotStoppedSpeakingFrame,
     Frame,
+    FunctionCallsFromLLMInfoFrame,
     LLMContextFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
@@ -46,6 +48,7 @@ from pipecat.services.llm_service import FunctionCallFromLLM, LLMService
 from pipecat.services.settings import LLMSettings
 from pipecat.utils.deprecation import deprecated
 from pipecat.utils.errors import ErrorCategory
+from pipecat.utils.text.alnum_utils import has_alnum
 from pipecat.utils.tracing.service_decorators import traced_llm
 from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given, is_given
 
@@ -716,6 +719,7 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
 
     @traced_llm
     async def _process_context(self, context: LLMContext):
+        response_generation = self._begin_tool_response()
         await self.push_frame(LLMFullResponseStartFrame())
 
         prompt_tokens = 0
@@ -846,7 +850,8 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
                                                         "type": "thought_signature",
                                                         "signature": part.thought_signature,
                                                         "bookmark": bookmark,
-                                                    }
+                                                    },
+                                                    is_metadata=True,
                                                 )
                                             ]
                                         )
@@ -894,7 +899,29 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
                     if candidate.finish_reason:
                         self._handle_finish_reason(candidate.finish_reason)
 
-            await self.run_function_calls(function_calls)
+            # Handle function calls if any were collected
+            if function_calls:
+                # Send the info frame with function calls so that it can be traced by service_decorators
+                await self.push_frame(
+                    FunctionCallsFromLLMInfoFrame(function_calls=function_calls),
+                    direction=FrameDirection.DOWNSTREAM,
+                )
+
+                # Defer function calls until after TTS only for speakable text.
+                # Unspeakable content (whitespace, punctuation, markup) never
+                # produces the BotStoppedSpeakingFrame that releases the
+                # deferral, so it must not count as generated text.
+                text_generated = has_alnum(accumulated_text)
+                if accumulated_text and not text_generated:
+                    logger.info(
+                        f"{self}: no speakable content ({accumulated_text[:120]!r}); "
+                        "running function calls without waiting for TTS"
+                    )
+                await self._run_or_defer_function_calls(
+                    function_calls,
+                    text_generated=text_generated,
+                    response_generation=response_generation,
+                )
         except (TimeoutError, DeadlineExceeded) as e:
             await self._call_event_handler("on_completion_timeout")
             await self.push_error(error_msg="LLM completion timeout", exception=e)
@@ -956,7 +983,11 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         """
         await super().process_frame(frame, direction)
 
-        if isinstance(frame, LLMContextFrame):
+        # Handle BotStoppedSpeakingFrame to execute pending function calls
+        if isinstance(frame, BotStoppedSpeakingFrame):
+            await self._run_pending_node_transition_function_calls(frame)
+            await self.push_frame(frame, direction)
+        elif isinstance(frame, LLMContextFrame):
             await self._process_context(frame.context)
         else:
             await self.push_frame(frame, direction)

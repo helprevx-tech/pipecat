@@ -16,6 +16,7 @@ frames the service pushes downstream.
 import asyncio
 import io
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from loguru import logger
@@ -98,13 +99,14 @@ def _make_service(
 
 async def _setup_service(service: GeminiLiveLLMService) -> None:
     """Give the service a task manager so it can start the deferral watchdog."""
-    await service.setup(
-        FrameProcessorSetup(
-            clock=SystemClock(),
-            task_manager=TaskManager(),
-            pipeline_worker=SimpleNamespace(app_resources=None),  # type: ignore[arg-type]
+    with patch.object(service, "_connect", new_callable=AsyncMock):
+        await service.setup(
+            FrameProcessorSetup(
+                clock=SystemClock(),
+                task_manager=TaskManager(),
+                pipeline_worker=SimpleNamespace(app_resources=None),  # type: ignore[arg-type]
+            )
         )
-    )
 
 
 def _frame_types(service) -> list[type]:

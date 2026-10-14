@@ -49,6 +49,10 @@ class GeminiLLMAdapter(BaseLLMAdapter[GeminiLLMInvocationParams]):
     - Extracting and sanitizing messages from the LLM context for logging with Gemini.
     """
 
+    # Seeded as the user turn preceding a conversation-opening function call,
+    # which Gemini rejects when it has no predecessor.
+    SEED_USER_TURN_TEXT = "call connected"
+
     def __init__(self):
         """Initialize the adapter."""
         super().__init__()
@@ -431,9 +435,26 @@ class GeminiLLMAdapter(BaseLLMAdapter[GeminiLLMInvocationParams]):
         # Remove any empty messages
         messages = [m for m in messages if m.parts]
 
+        # Gemini rejects a function call turn that does not immediately follow a
+        # user turn or a function response turn. When the bot opens the
+        # conversation and its opening turn calls a tool, the resulting function
+        # call is the very first turn and has no valid predecessor, so seed one.
+        if self._leads_with_function_call(messages):
+            messages.insert(0, Content(role="user", parts=[Part(text=self.SEED_USER_TURN_TEXT)]))
+
         return self.ConvertedMessages(
             messages=messages,
             system_instruction=extracted_system,
+        )
+
+    @staticmethod
+    def _leads_with_function_call(messages: list[Content]) -> bool:
+        """Whether the first turn is a model turn carrying a function call."""
+        if not messages:
+            return False
+        first = messages[0]
+        return first.role == "model" and any(
+            getattr(part, "function_call", None) for part in (first.parts or [])
         )
 
     def _from_standard_message(
