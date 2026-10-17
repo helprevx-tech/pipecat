@@ -96,7 +96,7 @@ async def _synthesize(service: SarvamHttpTTSService) -> dict:
 
 
 def test_v4_flash_defaults():
-    """The service has to land on the same speaker and rate the API defaults to."""
+    """Resolve the framework's explicit app speaker and output rate, independently of omitted API defaults."""
     service = _service()
 
     assert service._settings.voice == "shubh_en_narration_gentle"
@@ -253,3 +253,101 @@ class TestSpeakableTextFilter(unittest.IsolatedAsyncioTestCase):
 
         for text in ("हाँ", "你好", "да"):
             self.assertEqual(await filter.filter(text), text)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_http", [False, True], ids=["websocket", "http"])
+@pytest.mark.parametrize("pace,expected", [(0.3, 0.5), (2.8, 2.0)])
+async def test_model_switch_reapplies_pace_and_required_preprocessing(
+    monkeypatch, use_http, pace, expected
+):
+    """A valid v2 setting must not become an invalid v4 request after a model-only change."""
+    service = (
+        _http_service(_FakeSession(), model="bulbul:v2", pace=pace, enable_preprocessing=False)
+        if use_http
+        else _service(model="bulbul:v2", pace=pace, enable_preprocessing=False)
+    )
+    if not use_http:
+        monkeypatch.setattr(service, "_disconnect", AsyncMock())
+        monkeypatch.setattr(service, "_connect", AsyncMock())
+    await service._update_settings(service.Settings(model=V4_FLASH, enable_preprocessing=False))
+    assert service._settings.pace == expected
+    assert service._settings.enable_preprocessing is True
+    assert service._settings.voice == "shubh_en_narration_gentle"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_http", [False, True], ids=["websocket", "http"])
+async def test_model_switch_keeps_explicit_voice_even_when_value_is_unchanged(
+    monkeypatch, use_http
+):
+    """Explicit caller intent is not equivalent to membership in the changed-value dictionary.
+
+    A custom ID deliberately exercises provider-owned voice validation; this test
+    makes no claim that a real vendor accepts it for either model.
+    """
+    voice = "custom-persona-kept-by-caller"
+    service = (
+        _http_service(_FakeSession(), model="bulbul:v2", voice=voice)
+        if use_http
+        else _service(model="bulbul:v2", voice=voice)
+    )
+    if not use_http:
+        monkeypatch.setattr(service, "_disconnect", AsyncMock())
+        monkeypatch.setattr(service, "_connect", AsyncMock())
+    await service._update_settings(service.Settings(model=V4_FLASH, voice=voice))
+    assert service._settings.voice == voice
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_http", [False, True], ids=["websocket", "http"])
+async def test_explicit_null_voice_resolves_new_model_default(monkeypatch, use_http):
+    """Null means resolve the selected model's speaker, never send null or the legacy default."""
+    service = (
+        _http_service(_FakeSession(), model="bulbul:v3")
+        if use_http
+        else _service(model="bulbul:v3")
+    )
+    if not use_http:
+        monkeypatch.setattr(service, "_disconnect", AsyncMock())
+        monkeypatch.setattr(service, "_connect", AsyncMock())
+    await service._update_settings(service.Settings(model=V4_FLASH, voice=None))
+    assert service._settings.voice == "shubh_en_narration_gentle"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_http", [False, True], ids=["websocket", "http"])
+@pytest.mark.parametrize("model", [None, "", "bulbul:v400", "模型/unknown"])
+async def test_invalid_model_update_preserves_current_model_capabilities(
+    monkeypatch, use_http, model
+):
+    """Unsupported/missing model values cannot replace an accepted model or open a new connection."""
+    service = _http_service(_FakeSession()) if use_http else _service()
+    connect = AsyncMock()
+    if not use_http:
+        monkeypatch.setattr(service, "_disconnect", AsyncMock())
+        monkeypatch.setattr(service, "_connect", connect)
+    config = service._config
+    changed = await service._update_settings(service.Settings(model=model))
+    assert service._settings.model == V4_FLASH
+    assert service._config is config
+    assert "model" not in changed
+    connect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_http", [False, True], ids=["websocket", "http"])
+async def test_identical_model_and_voice_update_has_no_transport_effect(monkeypatch, use_http):
+    """Repeating already accepted settings is a local no-op, with no duplicate reconnect/config request."""
+    service = _http_service(_FakeSession()) if use_http else _service()
+    connect, config = AsyncMock(), AsyncMock()
+    if not use_http:
+        monkeypatch.setattr(service, "_disconnect", AsyncMock())
+        monkeypatch.setattr(service, "_connect", connect)
+        monkeypatch.setattr(service, "_send_config", config)
+    changed = await service._update_settings(
+        service.Settings(model=V4_FLASH, voice=service._settings.voice)
+    )
+    assert changed == {}
+    connect.assert_not_awaited()
+    config.assert_not_awaited()

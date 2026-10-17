@@ -1,0 +1,1 @@
+Fixed Sarvam HTTP/WebSocket runtime model changes to preserve explicitly selected voices, resolve null defaults, clamp pace and enable model-required preprocessing. Retains existing Bulbul v4 Flash support from upstream PR #5844 and adds both transport regressions.

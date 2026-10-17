@@ -33,6 +33,10 @@ Indian languages:
   'bulbul:v3' instead.", so it cannot synthesize.
 
 See https://docs.sarvam.ai/api-reference-docs/text-to-speech/stream for full API details.
+
+Runtime model changes resolve omitted/null speakers against the new model and
+reapply its pace/preprocessing constraints before synthesis or reconnection.
+Explicit speakers remain caller-owned even when unchanged in the settings delta.
 """
 
 import asyncio
@@ -618,7 +622,12 @@ class SarvamHttpTTSService(TTSService):
         return language_to_sarvam_language(language)
 
     async def _update_settings(self, delta: TTSSettings) -> dict[str, Any]:
-        """Apply a settings delta, switching to the new model's capabilities on a model change."""
+        """Apply an HTTP delta under the selected model's capabilities.
+
+        Unsupported models retain the previous model/configuration. Successful
+        switches preserve explicit non-null voices, clamp inherited pace and force
+        required preprocessing; this method performs no synthesis request.
+        """
         changed = await super()._update_settings(delta)
 
         if "model" in changed:
@@ -629,8 +638,14 @@ class SarvamHttpTTSService(TTSService):
                 self._sync_model_name_to_metrics()
             else:
                 self._config = config
-                if "voice" not in changed:
+                if not is_given(delta.voice) or delta.voice is None:
                     self._settings.voice = config.default_speaker
+                pace = assert_given(self._settings.pace)
+                pace_min, pace_max = config.pace_range
+                if pace is not None:
+                    self._settings.pace = max(pace_min, min(pace_max, pace))
+                if config.preprocessing_always_enabled:
+                    self._settings.enable_preprocessing = True
 
         return changed
 
@@ -1089,7 +1104,12 @@ class SarvamTTSService(InterruptibleTTSService):
             await self.push_error(error_msg=f"Error sending flush to Sarvam: {e}", exception=e)
 
     async def _update_settings(self, delta: TTSSettings) -> dict[str, Any]:
-        """Apply a settings delta, reconnecting on a model change and resending config otherwise."""
+        """Apply a streaming delta, reconnecting only for an accepted model change.
+
+        Revalidate model-dependent pace/preprocessing before reconnecting; preserve
+        explicit non-null voices even when equal to their old value. Unsupported
+        models retain the prior model/URL. Connection cancellation still propagates.
+        """
         changed = await super()._update_settings(delta)
 
         if "model" in changed:
@@ -1100,8 +1120,14 @@ class SarvamTTSService(InterruptibleTTSService):
                 self._sync_model_name_to_metrics()
             else:
                 self._config = config
-                if "voice" not in changed:
+                if not is_given(delta.voice) or delta.voice is None:
                     self._settings.voice = config.default_speaker
+                pace = assert_given(self._settings.pace)
+                pace_min, pace_max = config.pace_range
+                if pace is not None:
+                    self._settings.pace = max(pace_min, min(pace_max, pace))
+                if config.preprocessing_always_enabled:
+                    self._settings.enable_preprocessing = True
                 # The model is a URL query parameter, so a new model needs a new connection.
                 self._websocket_url = (
                     f"{self._url}?model={self._settings.model}&send_completion_event=true"
