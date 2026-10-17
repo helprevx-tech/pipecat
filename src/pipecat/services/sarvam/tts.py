@@ -37,6 +37,8 @@ See https://docs.sarvam.ai/api-reference-docs/text-to-speech/stream for full API
 Runtime model changes resolve omitted/null speakers against the new model and
 reapply its pace/preprocessing constraints before synthesis or reconnection.
 Explicit speakers remain caller-owned even when unchanged in the settings delta.
+Both transports serialize language_code without changing public language settings
+or the legacy target_language_code mapping alias.
 """
 
 import asyncio
@@ -664,7 +666,9 @@ class SarvamHttpTTSService(TTSService):
             # Build payload with common parameters
             payload = {
                 "text": text,
-                "target_language_code": self._settings.language,
+                # Sarvam's REST JSON uses language_code; public language settings
+                # and the WebSocket legacy target_language_code alias stay stable.
+                "language_code": self._settings.language,
                 "speaker": self._settings.voice,
                 "speech_sample_rate": self.sample_rate,
                 "enable_preprocessing": self._settings.enable_preprocessing,
@@ -1201,7 +1205,9 @@ class SarvamTTSService(InterruptibleTTSService):
             raise Exception("WebSocket not connected")
         # Build config dict for the API
         config_data = {
-            "target_language_code": self._settings.language,
+            # configure(target_language_code=...) is a Python SDK argument name;
+            # its current WebSocket serializer and AsyncAPI use language_code.
+            "language_code": self._settings.language,
             "speaker": self._settings.voice,
             "speech_sample_rate": self._speech_sample_rate,
             "enable_preprocessing": self._settings.enable_preprocessing,

@@ -1,0 +1,1 @@
+- Fixed Sarvam HTTP and WebSocket TTS requests to serialize `language_code`, matching the current provider wire contract. Existing language settings and the legacy `target_language_code` settings alias remain compatible.

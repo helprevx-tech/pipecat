@@ -4,7 +4,12 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-"""Sarvam model capabilities and text gating."""
+"""Sarvam capabilities, language wire serialization, switching and text gating.
+
+Local fake HTTP/WebSocket peers record native payloads without credentials or
+provider requests. Legacy language settings remain stable while current JSON
+uses language_code; these tests do not establish live synthesis acceptance.
+"""
 
 import json
 import unittest
@@ -351,3 +356,105 @@ async def test_identical_model_and_voice_update_has_no_transport_effect(monkeypa
     assert changed == {}
     connect.assert_not_awaited()
     config.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_http", [False, True], ids=["websocket", "http"])
+@pytest.mark.parametrize(
+    "model,pitch_loudness,temperature",
+    [("bulbul:v2", True, False), ("bulbul:v3", False, True), (V4_FLASH, True, False)],
+)
+@pytest.mark.parametrize("language,wire_language", [("en", "en-IN"), ("hi", "hi-IN")])
+async def test_language_wire_field_matches_current_provider_contract(
+    use_http, model, pitch_loudness, temperature, language, wire_language
+):
+    """Both native transports send language_code while retaining model-specific controls.
+
+    Official REST/AsyncAPI and the released Sarvam SDK agree on this JSON key.
+    Fake peers record payloads without provider requests. V2 remains a synthetic
+    compatibility case; this test does not establish current provider acceptance.
+    """
+    from pipecat.transcriptions.language import Language
+
+    settings = dict(
+        model=model, language=Language(language), pitch=0.25, loudness=1.2, temperature=0.8
+    )
+    if use_http:
+        service = _http_service(_FakeSession(), **settings)
+        config = await _synthesize(service)
+    else:
+        service = _service(**settings)
+        service._websocket = _FakeWebsocket()
+        await service._send_config()
+        config = _sent_config(service)
+    assert config["language_code"] == wire_language
+    assert "target_language_code" not in config
+    assert config["model"] == model
+    assert ("pitch" in config) is pitch_loudness
+    assert ("loudness" in config) is pitch_loudness
+    assert ("temperature" in config) is temperature
+
+
+@pytest.mark.asyncio
+async def test_legacy_language_alias_stays_public_but_never_becomes_a_wire_key():
+    """The existing mapping alias still configures initial/runtime language without leaking to JSON."""
+    from pipecat.transcriptions.language import Language
+
+    settings = SarvamTTSService.Settings.from_mapping(
+        {"model": V4_FLASH, "target_language_code": Language.HI}
+    )
+    assert settings.language == Language.HI
+    assert "target_language_code" not in settings.extra
+    service = SarvamTTSService(api_key="test-key", settings=settings)
+    service._websocket = _FakeWebsocket()
+    await service._send_config()
+    initial = _sent_config(service)
+    assert initial["language_code"] == "hi-IN"
+    assert "target_language_code" not in initial
+
+    changed = await service._update_settings(
+        service.Settings.from_mapping({"target_language_code": Language.MR})
+    )
+    updated = _sent_config(service)
+    assert changed == {"language": "hi-IN"}
+    assert updated == {**initial, "language_code": "mr-IN"}
+    assert service._settings.language == "mr-IN"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_http", [False, True], ids=["websocket", "http"])
+@pytest.mark.parametrize(
+    "original,selected",
+    [("bulbul:v2", V4_FLASH), ("bulbul:v3", V4_FLASH), (V4_FLASH, "bulbul:v3")],
+)
+async def test_model_switch_preserves_language_and_uses_only_current_wire_key(
+    monkeypatch, use_http, original, selected
+):
+    """A model switch preserves configured language and emits the new model's exact payload shape."""
+    from pipecat.transcriptions.language import Language
+
+    if use_http:
+        service = _http_service(_FakeSession(), model=original, language=Language.TA)
+    else:
+        service = _service(model=original, language=Language.TA)
+        service._websocket = _FakeWebsocket()
+
+        async def reconnect():
+            """Replace only the fake connection and execute the real configuration serializer."""
+            service._websocket = _FakeWebsocket()
+            await service._send_config()
+
+        monkeypatch.setattr(service, "_disconnect", AsyncMock())
+        monkeypatch.setattr(service, "_connect", AsyncMock(side_effect=reconnect))
+    await service._update_settings(service.Settings(model=selected))
+    if use_http:
+        config = await _synthesize(service)
+    else:
+        config = _sent_config(service)
+        assert _url_model(service) == selected
+        service._disconnect.assert_awaited_once()
+        service._connect.assert_awaited_once()
+    assert config["language_code"] == "ta-IN"
+    assert "target_language_code" not in config
+    assert config["model"] == selected
+    assert config["speaker"] == ("shubh_en_narration_gentle" if selected == V4_FLASH else "shubh")
