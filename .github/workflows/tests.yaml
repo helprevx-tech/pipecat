@@ -44,6 +44,7 @@ jobs:
             --extra daily \
             --extra deepgram \
             --extra google \
+            --extra groq \
             --extra langchain \
             --extra livekit \
             --extra mcp \
