@@ -7,7 +7,9 @@
 """Deepgram text-to-speech service implementation.
 
 This module provides integration with Deepgram's text-to-speech API
-for generating speech from text using various voice models.
+for generating speech from text using various voice models. WebSocket character
+observations follow a completed local Speak submission, independently of audio
+delivery or provider billing.
 """
 
 import json
@@ -380,6 +382,9 @@ class DeepgramTTSService(WebsocketTTSService):
 
         Yields:
             Frame: Audio frames containing the synthesized speech, plus start/stop frames.
+
+        Usage is reported after the local Speak send completes; send failure or
+        cancellation does not create an observation or retry the text.
         """
         try:
             # Reconnect if the websocket is closed
@@ -391,6 +396,7 @@ class DeepgramTTSService(WebsocketTTSService):
             # LLM finishes a complete response via flush_audio()
             speak_msg = {"type": "Speak", "text": text}
             await self._get_websocket().send(json.dumps(speak_msg))
+            await self.start_tts_usage_metrics(text)
 
             # The audio frames will be handled in _receive_messages
             yield None

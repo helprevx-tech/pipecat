@@ -4,7 +4,12 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-"""Base classes for Text-to-speech services."""
+"""Base classes for Text-to-speech services.
+
+Provider usage callbacks own character observations. TOKEN mode aggregates only
+reported text, while turn completion, interruption and cancellation release its
+pending observation without inferring acceptance from raw input or audio frames.
+"""
 
 import asyncio
 import uuid
@@ -482,17 +487,33 @@ class TTSService(AIService):
         return True
 
     async def start_tts_usage_metrics(self, text: str):
-        """Record TTS usage metrics.
+        """Record the provider's TTS usage observation at its chosen reporting point.
 
-        When streaming tokens, usage metrics are aggregated and reported at
-        flush time instead of per token, so individual calls are skipped.
+        During TOKEN processing, retain reported text for the turn's aggregate.
+        A report arriving outside that window is emitted immediately so a late
+        provider callback cannot become part of the next turn. The callback does
+        not itself establish a provider invoice or successful audio delivery.
 
         Args:
-            text: The text being processed by TTS.
+            text: Provider-facing text represented by this usage observation.
         """
-        if self._is_streaming_tokens:
+        if self._is_streaming_tokens and self._processing_text:
+            self._streamed_text += text
             return
         await super().start_tts_usage_metrics(text)
+
+    async def _flush_tts_usage_metrics(self):
+        """Emit and consume the reported TOKEN text without replaying an uncertain delivery.
+
+        Detach before awaiting frame transport so reentrant reports cannot be
+        cleared or emitted twice. Callers close the processing window first;
+        late callbacks then emit independently. Transport errors/cancellation
+        propagate unchanged; this local observation has no durable retry journal.
+        """
+        text, self._streamed_text = self._streamed_text, ""
+        if text:
+            logger.debug(f"{self}: Generating TTS [{text}]")
+            await super().start_tts_usage_metrics(text)
 
     async def start_text_aggregation_metrics(self):
         """Start text aggregation metrics if not already started.
@@ -688,12 +709,18 @@ class TTSService(AIService):
     async def cancel(self, frame: CancelFrame):
         """Cancel the TTS service.
 
+        Stop the owned audio task. Usage transport belongs to the control-frame
+        caller after all subclass cancellation hooks have released their sockets.
+
         Args:
             frame: The cancel frame.
         """
-        await super().cancel(frame)
-        # Prompt stop of audio production. cleanup() repeats this idempotently.
-        await self._stop_audio_context_task()
+        self._processing_text = False
+        try:
+            await super().cancel(frame)
+        finally:
+            # Prompt stop precedes metric transport; cleanup repeats this safely.
+            await self._stop_audio_context_task()
 
     def add_text_transformer(
         self,
@@ -918,6 +945,10 @@ class TTSService(AIService):
 
         Handles TextFrames for synthesis, interruption frames, settings updates,
         and various control frames.
+        Independent speak frames release their reported usage immediately;
+        speech nested inside an active LLM turn retains that turn's aggregate.
+        Control frames are forwarded even if usage emission fails. A blocked
+        metric transport still relies on the worker's existing cancellation bound.
 
         Args:
             frame: The frame to process.
@@ -942,7 +973,17 @@ class TTSService(AIService):
             await self._process_text_frame(frame)
         elif isinstance(frame, InterruptionFrame):
             await self._handle_interruption(frame, direction)
-            await self.push_frame(frame, direction)
+            try:
+                await self._flush_tts_usage_metrics()
+            finally:
+                await self.push_frame(frame, direction)
+        elif isinstance(frame, CancelFrame):
+            # super().process_frame already completed the full dynamic cancel
+            # chain, including provider socket/receive teardown, before emission.
+            try:
+                await self._flush_tts_usage_metrics()
+            finally:
+                await self.push_frame(frame, direction)
         elif isinstance(frame, LLMFullResponseStartFrame):
             self._llm_response_started = True
             # New LLM turn → assign a fresh context ID shared by all sentences
@@ -983,15 +1024,13 @@ class TTSService(AIService):
             # pause to avoid audio overlapping.
             await self._maybe_pause_frame_processing()
 
-            # Log accumulated streamed text and emit aggregated usage metric.
-            if self._streamed_text:
-                logger.debug(f"{self}: Generating TTS [{self._streamed_text}]")
-                await super().start_tts_usage_metrics(self._streamed_text)
-                self._streamed_text = ""
-
-            # Reset aggregator state
+            # Close the usage window before emission: an accepted late callback
+            # must not be stranded in this flushed turn or cleared with its text.
             sent_text = self._processing_text
             self._processing_text = False
+            await self._flush_tts_usage_metrics()
+
+            # Reset aggregator state.
             self._sent_non_whitespace_in_context = False
             if isinstance(frame, LLMFullResponseEndFrame):
                 if self._push_text_frames:
@@ -1063,6 +1102,8 @@ class TTSService(AIService):
             self._turn_context_id = saved_turn_context_id
             self._sent_non_whitespace_in_context = saved_sent_non_whitespace
             self._processing_text = processing_text
+            if not processing_text:
+                await self._flush_tts_usage_metrics()
         elif isinstance(frame, TTSUpdateSettingsFrame):
             if frame.service is not None and frame.service is not self:
                 await self.push_frame(frame, direction)
@@ -1227,11 +1268,16 @@ class TTSService(AIService):
             yield TTSAudioRawFrame(audio, self.sample_rate, 1, context_id=context_id)
 
     async def _handle_interruption(self, frame: InterruptionFrame, direction: FrameDirection):
+        """Retain reported usage while resetting interrupted text, audio contexts and pause state.
+
+        The control-frame caller emits pending reported usage after this full
+        dynamic hook returns, including subclass reconnect work. No metric sink
+        is awaited here, so it cannot bypass or delay provider cleanup.
+        """
         self._processing_text = False
         self._sent_non_whitespace_in_context = False
         self._bot_speaking = False
         self._llm_response_started = False
-        self._streamed_text = ""
         self._text_aggregation_metrics_started = False
         self._pending_llm_response_end_frames.clear()
 
@@ -1241,9 +1287,8 @@ class TTSService(AIService):
 
         await self._interrupt_audio_contexts()
         self._create_audio_context_task()
-        # Interrupted playback may never send the BotStoppedSpeakingFrame that
-        # normally resumes processing. Uninterruptible speech still open pauses
-        # it again until its context ends.
+        # Interrupted playback may never send BotStoppedSpeakingFrame to
+        # resume processing. Uninterruptible contexts retain their pause.
         if self._pause_frame_processing and self._uninterruptible_speech_pending():
             await self.pause_processing_frames()
         else:
@@ -1405,10 +1450,6 @@ class TTSService(AIService):
             push_assistant_aggregation=push_assistant_aggregation,
             interruptible=src_frame.interruptible,
         )
-
-        # Accumulate text for a single debug log at flush time when streaming tokens.
-        if self._is_streaming_tokens:
-            self._streamed_text += text
 
         # Two things disqualify the measurement. A service that hands text off
         # for synthesis elsewhere would time only the handoff, and a token is

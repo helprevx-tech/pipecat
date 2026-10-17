@@ -1305,12 +1305,17 @@ class SarvamTTSService(InterruptibleTTSService):
             await self._websocket.send(json.dumps(msg))
 
     async def _send_text(self, text: str):
-        """Send text to Sarvam WebSocket for synthesis."""
-        if self._websocket and self._websocket.state == State.OPEN:
-            msg = {"type": "text", "data": {"text": text}}
-            await self._websocket.send(json.dumps(msg))
-        else:
-            logger.warning("WebSocket not ready, cannot send text")
+        """Send text only on an open socket, raising when no submission can occur.
+
+        The sole caller reports character usage after this await completes. An
+        unavailable socket must enter that caller's existing error/recovery path
+        rather than look like a successful no-op. Send errors and cancellation
+        propagate unchanged; this helper never reconnects or retries text.
+        """
+        if not self._websocket or self._websocket.state != State.OPEN:
+            raise RuntimeError("WebSocket not ready, cannot send text")
+        msg = {"type": "text", "data": {"text": text}}
+        await self._websocket.send(json.dumps(msg))
 
     @traced_tts
     async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame | None, None]:

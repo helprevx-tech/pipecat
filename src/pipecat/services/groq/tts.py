@@ -4,7 +4,11 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-"""Groq text-to-speech service implementation."""
+"""Groq text-to-speech service implementation.
+
+Character observations follow successful request creation. A later audio-read
+failure does not erase submitted work; observations are not provider invoices.
+"""
 
 import io
 import wave
@@ -188,6 +192,9 @@ class GroqTTSService(TTSService):
 
         Yields:
             Frame: Audio frames containing the synthesized speech data.
+
+        Report the request once after successful creation, retaining that usage
+        if audio iteration later fails. Creation failure/cancellation reports none.
         """
         measuring_ttfb = True
         try:
@@ -213,6 +220,7 @@ class GroqTTSService(TTSService):
                 speed=speed,
                 input=text,
             )
+            await self.start_tts_usage_metrics(text)
 
             async for data in response.iter_bytes():
                 if measuring_ttfb:

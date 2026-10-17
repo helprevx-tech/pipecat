@@ -9,7 +9,8 @@
 This module provides a Pipecat TTS service that connects to Deepgram models
 deployed on AWS SageMaker endpoints. Uses HTTP/2 bidirectional streaming for
 low-latency real-time speech synthesis with support for interruptions and
-streaming audio output.
+streaming audio output. Character observations follow completed local Speak
+submissions; they do not establish provider invoices or delivered audio.
 """
 
 import asyncio
@@ -393,6 +394,9 @@ class DeepgramSageMakerTTSService(TTSService):
         Yields:
             Frame: TTSStartedFrame, then None (audio comes asynchronously via
             the response processor).
+
+        The usage callback follows a completed native send. Inactive sessions,
+        send errors and cancellation cannot record an unsent request.
         """
         if self._client is None:
             logger.warning(f"{self}: client unavailable, skipping TTS")
@@ -400,6 +404,7 @@ class DeepgramSageMakerTTSService(TTSService):
             return
         try:
             await self._client.send_json({"type": "Speak", "text": text})
+            await self.start_tts_usage_metrics(text)
             yield None
         except Exception as e:
             yield ErrorFrame(error=f"Unknown error occurred: {e}")

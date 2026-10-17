@@ -9,16 +9,21 @@
 Local fake HTTP/WebSocket peers record native payloads without credentials or
 provider requests. Legacy language settings remain stable while current JSON
 uses language_code; these tests do not establish live synthesis acceptance.
+Text-send guards require an open socket before reporting submitted characters;
+failed connects, non-open state, provider exceptions and cancellation stay local.
 """
 
+import asyncio
 import json
 import unittest
+from contextlib import aclosing
 from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlparse
 
 import pytest
 from websockets.protocol import State
 
+from pipecat.frames.frames import ErrorFrame, TTSStoppedFrame
 from pipecat.services.sarvam.tts import (
     SarvamHttpTTSService,
     SarvamTTSService,
@@ -458,3 +463,174 @@ async def test_model_switch_preserves_language_and_uses_only_current_wire_key(
     assert "target_language_code" not in config
     assert config["model"] == selected
     assert config["speaker"] == ("shubh_en_narration_gentle" if selected == V4_FLASH else "shubh")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", [None, State.CONNECTING, State.CLOSING, State.CLOSED])
+async def test_send_text_requires_an_open_socket(state):
+    """An absent/non-open connection is a failed submission, never a successful silent no-op."""
+    service = _service()
+    socket = _FakeWebsocket(state=state) if state is not None else None
+    service._websocket = socket
+    try:
+        with pytest.raises(RuntimeError, match="^WebSocket not ready, cannot send text$"):
+            await service._send_text("नमस्ते 🌏 café")
+        if socket is not None:
+            assert socket.sent == []
+    finally:
+        if socket is not None:
+            await socket.close()
+        service._websocket = None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", [None, State.CONNECTING, State.CLOSING, State.CLOSED])
+async def test_non_open_send_uses_existing_error_recovery_without_usage(monkeypatch, state):
+    """All failed availability states produce existing error/stop frames without claiming sent characters or replaying text."""
+    service = _service()
+    socket = _FakeWebsocket(state=state) if state is not None else None
+    service._websocket = socket
+    connect, disconnect, usage = AsyncMock(), AsyncMock(), AsyncMock()
+    monkeypatch.setattr(service, "_connect", connect)
+    monkeypatch.setattr(service, "_disconnect", disconnect)
+    monkeypatch.setattr(service, "start_tts_usage_metrics", usage)
+    try:
+        async with aclosing(service.run_tts("नमस्ते 🌏 café", "no-open-send")) as stream:
+            frames = [frame async for frame in stream]
+        assert len(frames) == 2 and isinstance(frames[0], ErrorFrame)
+        assert frames[0].error == "Unknown error occurred: WebSocket not ready, cannot send text"
+        assert isinstance(frames[1], TTSStoppedFrame)
+        assert frames[1].context_id == "no-open-send"
+        usage.assert_not_awaited()
+        disconnect.assert_awaited_once()
+        assert connect.await_count == (2 if state in (None, State.CLOSED) else 1)
+        if socket is not None:
+            assert socket.sent == []
+    finally:
+        if socket is not None:
+            await socket.close()
+        service._websocket = None
+
+
+@pytest.mark.asyncio
+async def test_native_failed_connect_cannot_report_submitted_characters(monkeypatch):
+    """The real connection-error serializer may return None; run_tts must still refuse a nonexistent send.
+
+    Only socket creation, event delivery and existing recovery bookkeeping are
+    inert. No receive/keepalive tasks or provider connections are started.
+    """
+    service = _service()
+    failure = ConnectionError("Synthetic connection failure")
+    connector = AsyncMock(side_effect=failure)
+    report, event, disconnect, usage = AsyncMock(), AsyncMock(), AsyncMock(), AsyncMock()
+    monkeypatch.setattr(service, "_websocket_connect", connector)
+    monkeypatch.setattr(service, "push_error", report)
+    monkeypatch.setattr(service, "_call_event_handler", event)
+    monkeypatch.setattr(service, "_disconnect", disconnect)
+    monkeypatch.setattr(service, "start_tts_usage_metrics", usage)
+
+    async def failed_connect():
+        """Exercise the real failed connection path while avoiding unrelated processor task setup."""
+        await service._connect_websocket()
+
+    monkeypatch.setattr(service, "_connect", AsyncMock(side_effect=failed_connect))
+    try:
+        async with aclosing(service.run_tts("नमस्ते", "failed-connect")) as stream:
+            frames = [frame async for frame in stream]
+        assert service._websocket is None
+        assert len(frames) == 2 and isinstance(frames[0], ErrorFrame)
+        assert isinstance(frames[1], TTSStoppedFrame)
+        usage.assert_not_awaited()
+        disconnect.assert_awaited_once()
+        assert connector.await_count == service._connect.await_count == 2
+        assert all(call.kwargs["exception"] is failure for call in report.await_args_list)
+        assert report.await_count == 2
+    finally:
+        service._websocket = None
+
+
+@pytest.mark.asyncio
+async def test_open_socket_send_exception_keeps_existing_error_contract(monkeypatch):
+    """A real send failure stays unchanged at the helper and reaches the existing caller recovery without usage."""
+    service = _service()
+    socket = _FakeWebsocket()
+    failure = ConnectionError("Synthetic send failure")
+    socket.send = AsyncMock(side_effect=failure)
+    service._websocket = socket
+    connect, disconnect, usage = AsyncMock(), AsyncMock(), AsyncMock()
+    monkeypatch.setattr(service, "_connect", connect)
+    monkeypatch.setattr(service, "_disconnect", disconnect)
+    monkeypatch.setattr(service, "start_tts_usage_metrics", usage)
+    try:
+        with pytest.raises(ConnectionError) as caught:
+            await service._send_text("नमस्ते")
+        assert caught.value is failure
+        socket.send.reset_mock()
+        async with aclosing(service.run_tts("नमस्ते", "send-failure")) as stream:
+            frames = [frame async for frame in stream]
+        assert len(frames) == 2 and isinstance(frames[0], ErrorFrame)
+        assert frames[0].error == "Unknown error occurred: Synthetic send failure"
+        assert isinstance(frames[1], TTSStoppedFrame)
+        usage.assert_not_awaited()
+        socket.send.assert_awaited_once()
+        connect.assert_awaited_once()
+        disconnect.assert_awaited_once()
+        assert socket.sent == []
+    finally:
+        await socket.close()
+        service._websocket = None
+
+
+@pytest.mark.asyncio
+async def test_open_socket_send_cancellation_propagates_without_usage_or_reconnect(monkeypatch):
+    """Cancellation remains the caller's exact BaseException; this path neither reconnects nor reports an unconfirmed send."""
+    service = _service()
+    socket = _FakeWebsocket()
+    cancelled = asyncio.CancelledError("Synthetic send cancellation")
+    socket.send = AsyncMock(side_effect=cancelled)
+    service._websocket = socket
+    connect, disconnect, usage = AsyncMock(), AsyncMock(), AsyncMock()
+    monkeypatch.setattr(service, "_connect", connect)
+    monkeypatch.setattr(service, "_disconnect", disconnect)
+    monkeypatch.setattr(service, "start_tts_usage_metrics", usage)
+    try:
+        with pytest.raises(asyncio.CancelledError) as caught:
+            async with aclosing(service.run_tts("नमस्ते", "send-cancelled")) as stream:
+                _ = [frame async for frame in stream]
+        assert caught.value is cancelled
+        socket.send.assert_awaited_once()
+        usage.assert_not_awaited()
+        connect.assert_not_awaited()
+        disconnect.assert_not_awaited()
+        assert socket.sent == []
+    finally:
+        await socket.close()
+        service._websocket = None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["bulbul:v3", V4_FLASH])
+async def test_open_socket_unicode_send_reports_exactly_once_after_completion(monkeypatch, model):
+    """A successful Unicode send keeps exact text/model and one usage observation without reconnecting or duplicating submission."""
+    service = _service(model=model)
+    socket = _FakeWebsocket()
+    service._websocket = socket
+    connect, disconnect, usage = AsyncMock(), AsyncMock(), AsyncMock()
+    monkeypatch.setattr(service, "_connect", connect)
+    monkeypatch.setattr(service, "_disconnect", disconnect)
+    monkeypatch.setattr(service, "start_tts_usage_metrics", usage)
+    text = "नमस्ते 🌏 café e\u0301"
+    try:
+        async with aclosing(service.run_tts(text, "send-success")) as stream:
+            frames = [frame async for frame in stream]
+        assert frames == [None]
+        assert [json.loads(message) for message in socket.sent] == [
+            {"type": "text", "data": {"text": text}}
+        ]
+        assert service._settings.model == model
+        usage.assert_awaited_once_with(text)
+        connect.assert_not_awaited()
+        disconnect.assert_not_awaited()
+    finally:
+        await socket.close()
+        service._websocket = None
