@@ -21,6 +21,7 @@ from pipecat.frames.frames import (
     FunctionCallFromLLM,
     FunctionCallResultFrame,
     FunctionCallsStartedFrame,
+    LLMContextUserTurnFrame,
     NodeTransitionStartedFrame,
     TextFrame,
 )
@@ -77,7 +78,11 @@ async def test_node_transition_commits_user_context_before_ack_without_inference
     await aggregator._handle_node_transition_started(NodeTransitionStartedFrame([], acknowledged))
     assert acknowledged.is_set()
     assert context.messages == [{"role": "user", "content": "pending transcript"}]
-    aggregator.push_frame.assert_not_awaited()
+    # Preserve upstream's exact bidirectional turn notifications, while refusing
+    # any inference frame before the transition result owns its next response.
+    notifications = aggregator.push_frame.await_args_list
+    assert [type(call.args[0]) for call in notifications] == [LLMContextUserTurnFrame] * 2
+    assert all(call.args[0].text == "pending transcript" for call in notifications)
 
 
 def test_public_mute_callback_alias_remains_importable():
@@ -298,7 +303,9 @@ async def test_context_ack_gate_preserves_valid_and_nonrequired_dispatch(
     if acknowledge:
         assert transitions[0].context_aggregation_event.is_set()
         assert context.messages == [{"role": "user", "content": "pending caller answer"}]
-        state.aggregator.push_frame.assert_not_awaited()
+        notifications = state.aggregator.push_frame.await_args_list
+        assert [type(call.args[0]) for call in notifications] == [LLMContextUserTurnFrame] * 2
+        assert all(call.args[0].text == "pending caller answer" for call in notifications)
     elif name == "transition":
         assert transitions[0].context_aggregation_event is None
     else:

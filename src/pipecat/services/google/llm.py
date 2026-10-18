@@ -170,7 +170,8 @@ class GoogleLLMSettings(LLMSettings):
         thinking: Thinking configuration. If this is not provided, Pipecat
             sends the lowest thinking setting Google documents for the model,
             for the fastest responses, and logs what it sent. Models Pipecat
-            doesn't list run at Google's default.
+            doesn't list, and any model when ``use_provider_thinking_default`` is
+            set, run at Google's default.
         safety_settings: Content safety filters, as a list of
             :class:`~google.genai.types.SafetySetting`. Each entry pairs a harm
             category with the threshold at which content is blocked. Categories
@@ -467,6 +468,9 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
             config=generation_config,
         )
 
+        if response.candidates and response.candidates[0].finish_reason:
+            self._handle_finish_reason(response.candidates[0].finish_reason)
+
         # Extract text from response
         if response.candidates and response.candidates[0].content:
             for part in response.candidates[0].content.parts or []:
@@ -565,9 +569,10 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
 
         Applies the model's entry in ``_THINKING_DEFAULTS``, if it has one.
         Generation params that already set ``thinking_config``, from the
-        settings or from ``extra``, are left as they are. The first request for
-        each model logs the setting sent or, for a model that can think but
-        isn't listed, warns that it runs at Google's default.
+        settings or from ``extra``, are left as they are, and so are all
+        generation params when ``use_provider_thinking_default`` is set. The first
+        request for each model logs the setting sent, or that the model runs at
+        Google's default, warning for an unlisted model that can think.
 
         Args:
             generation_params: The generation params dict (modified in place).
@@ -752,7 +757,7 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         Anything other than a normal stop leaves the turn short of what the model
         would otherwise have said: the response was withheld (safety, recitation,
         prohibited content), a tool call was rejected, or the output hit the token
-        limit. Whatever text did arrive is still passed downstream.
+        limit. Whatever text did arrive is still passed on.
         """
         if finish_reason in (FinishReason.STOP, FinishReason.FINISH_REASON_UNSPECIFIED):
             return

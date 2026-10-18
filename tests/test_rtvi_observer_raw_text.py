@@ -11,6 +11,8 @@ import warnings
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import pytest
+
 import pipecat.processors.frameworks.rtvi.models as RTVI
 from pipecat.frames.frames import (
     AggregatedTextFrame,
@@ -163,12 +165,16 @@ class TestRTVIObserverRawText(unittest.IsolatedAsyncioTestCase):
 
 class TestRTVIObserverParamsUserTranscription(unittest.TestCase):
     def test_turning_user_transcription_off_is_deprecated(self):
-        with self.assertWarnsRegex(
-            DeprecationWarning, "`RTVIObserverParams.user_transcription_enabled` is deprecated"
+        with pytest.warns(
+            DeprecationWarning,
+            match="`RTVIObserverParams.user_transcription_enabled` is deprecated",
         ) as caught:
             RTVIObserverParams(user_transcription_enabled=False)
 
-        self.assertEqual(caught.filename, __file__)
+        self.assertEqual(
+            next(item.filename for item in caught if issubclass(item.category, DeprecationWarning)),
+            __file__,
+        )
 
     def test_leaving_user_transcription_on_is_not_deprecated(self):
         with warnings.catch_warnings():

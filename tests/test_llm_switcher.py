@@ -8,6 +8,8 @@
 
 import unittest
 
+import pytest
+
 from pipecat.adapters.schemas.direct_function import tool_options
 from pipecat.frames.frames import Frame, LLMUpdateSettingsFrame
 from pipecat.pipeline.llm_switcher import LLMSwitcher
@@ -101,7 +103,7 @@ class TestLLMSwitcherDirectFunctions(unittest.TestCase):
         llm2 = _MockLLMService()
         switcher = LLMSwitcher(llms=[llm1, llm2])
 
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             switcher.register_direct_function(get_current_weather)
 
         for llm in (llm1, llm2):
@@ -184,7 +186,7 @@ class TestLLMSwitcherRegisterFunctionOptionPrecedence(unittest.TestCase):
         # Regression: the switcher used to default cancel_on_interruption to True
         # and forward it as an explicit value, overriding the handler's @tool_options.
         switcher, members = self._switcher()
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             switcher.register_direct_function(end_call)  # decorated: False / 60
         for llm in members:
             item = llm._functions["end_call"]
@@ -193,7 +195,7 @@ class TestLLMSwitcherRegisterFunctionOptionPrecedence(unittest.TestCase):
 
     def test_register_direct_function_explicit_arg_overrides_decorator(self):
         switcher, members = self._switcher()
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             switcher.register_direct_function(end_call, cancel_on_interruption=True)
         for llm in members:
             item = llm._functions["end_call"]

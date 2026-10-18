@@ -50,6 +50,7 @@ import asyncio
 import itertools
 import time
 import unittest
+import warnings
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -752,13 +753,20 @@ class TestMOQTransportInit(unittest.TestCase):
         """Pydantic drops unknown fields, so without the alias a bot that
         pinned the pre-1.8.0 ``serve_bind`` would silently listen on the
         default address instead."""
-        with self.assertWarns(DeprecationWarning):
+        # Capture only this actual constructor, without unittest scanning other
+        # optional modules' warning registries and triggering lazy SDK imports.
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always", DeprecationWarning)
             bind = self._bind_for(serve=True, serve_bind="[::]:9000")
+        self.assertTrue(any(issubclass(item.category, DeprecationWarning) for item in captured))
         self.assertEqual(bind, "[::]:9000")
 
     def test_bind_wins_over_deprecated_serve_bind(self):
-        with self.assertWarns(DeprecationWarning):
+        """Explicit bind wins while the actual deprecated alias still warns locally."""
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always", DeprecationWarning)
             bind = self._bind_for(serve=True, bind="[::]:1", serve_bind="[::]:2")
+        self.assertTrue(any(issubclass(item.category, DeprecationWarning) for item in captured))
         self.assertEqual(bind, "[::]:1")
 
     def test_explicit_paths_override_the_namespace_layer(self):

@@ -21,6 +21,8 @@ include mocked dependencies for PipelineTask and LLM services.
 import unittest
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
+import pytest
+
 from pipecat.flows.exceptions import FlowError, FlowTransitionError
 from pipecat.flows.manager import FlowManager, NodeConfig
 from pipecat.flows.types import (
@@ -107,7 +109,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
         self.assertIs(flow_manager.worker, self.mock_worker)
 
         # task= still works but is deprecated
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             flow_manager = FlowManager(
                 task=self.mock_worker,
                 llm=self.mock_llm,
@@ -116,7 +118,7 @@ class TestFlowManager(unittest.IsolatedAsyncioTestCase):
         self.assertIs(flow_manager.worker, self.mock_worker)
 
         # The task property still resolves to the worker, but is deprecated
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             self.assertIs(flow_manager.task, self.mock_worker)
 
         # Passing both is an error

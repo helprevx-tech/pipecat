@@ -89,12 +89,17 @@ class TestFrameQueueRetention(unittest.IsolatedAsyncioTestCase):
         for queue_type in (FrameQueue, FramePriorityQueue):
             with self.subTest(queue_type=queue_type.__name__):
                 queue = queue_type(frame_getter=lambda item: item[2])
-                stale, current, normal, end = TextFrame("stale"), TextFrame("current"), TextFrame("normal"), EndFrame()
+                stale, current, normal, end = (
+                    TextFrame("stale"),
+                    TextFrame("current"),
+                    TextFrame("normal"),
+                    EndFrame(),
+                )
                 stale.interruptible = current.interruptible = False
                 for index, frame in enumerate((stale, current, normal, end)):
                     queue.put_nowait((index, index, frame))
 
-                queue.reset(keep_frame=lambda frame: frame is not stale)
+                queue.reset(keep_frame=lambda frame, stale=stale: frame is not stale)
 
                 self.assertEqual(queue.qsize(), 2)
                 for expected in (current, end):

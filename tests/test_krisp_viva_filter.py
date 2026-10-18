@@ -12,6 +12,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pytest
 
 # Mock krisp_audio module BEFORE any pipecat imports
 # This allows tests to run without krisp_audio installed
@@ -130,7 +131,7 @@ class TestKrispVivaFilter(unittest.IsolatedAsyncioTestCase):
     async def test_initialization_with_deprecated_env_variable(self):
         """Test that the KRISP_VIVA_MODEL_PATH fallback works and warns."""
         with patch.dict(os.environ, {"KRISP_VIVA_MODEL_PATH": self.model_path}, clear=True):
-            with self.assertWarnsRegex(DeprecationWarning, "KRISP_VIVA_MODEL_PATH"):
+            with pytest.warns(DeprecationWarning, match="KRISP_VIVA_MODEL_PATH"):
                 filter_instance = KrispVivaFilter()
 
             self.assertEqual(filter_instance._model_path, self.model_path)

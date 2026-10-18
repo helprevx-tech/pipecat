@@ -11,6 +11,8 @@ import types
 import unittest
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from pipecat.evals.fastapi_transport import (
     EvalFastAPIWebsocketInputTransport,
     EvalFastAPIWebsocketOutputTransport,
@@ -78,7 +80,7 @@ class TestConnectionOutputSettings(unittest.IsolatedAsyncioTestCase):
         await self._assert_tts_resets_between_connections("/?skip_tts=false")
 
     async def _assert_tts_resets_between_connections(self, audio_path: str):
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             transport = EvalTransport(params=EvalTransportParams())
         self.addAsyncCleanup(transport.cleanup)
         input_transport = transport.input()

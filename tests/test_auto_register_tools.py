@@ -10,6 +10,7 @@ import io
 import types
 import unittest
 
+import pytest
 from loguru import logger
 
 from pipecat.adapters.schemas.direct_function import tool_options
@@ -587,7 +588,7 @@ class TestDeprecatedExplicitRegistrationApi(unittest.TestCase):
 
     def test_register_direct_function_warns_and_registers(self):
         service = LLMService()
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             service.register_direct_function(end_call)
         # Still works, decorator options included.
         item = service._functions["end_call"]
@@ -597,7 +598,7 @@ class TestDeprecatedExplicitRegistrationApi(unittest.TestCase):
     def test_unregister_direct_function_warns_and_unregisters(self):
         service = LLMService()
         service._register_direct_function(get_current_weather)
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             service.unregister_direct_function(get_current_weather)
         self.assertNotIn("get_current_weather", service._functions)
 
@@ -622,7 +623,7 @@ class TestToolDecoratorSharesAnnotation(unittest.TestCase):
     def test_tool_timeout_alias_is_deprecated_but_works(self):
         from pipecat.workers.llm.tool_decorator import tool
 
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
 
             @tool(timeout=30)
             async def my_tool(self, params: FunctionCallParams, arg: str):

@@ -509,6 +509,40 @@ class TestReceiveResponseEventsFunctionCalls:
 
 class TestReceiveResponseEventsErrors:
     @pytest.mark.asyncio
+    async def test_response_incomplete_reports_reason_and_usage(self):
+        service = _make_service()
+        service.stop_ttfb_metrics = AsyncMock()
+        service.start_llm_usage_metrics = AsyncMock()
+        service.push_error = AsyncMock()
+
+        ws = _ws_events(
+            {
+                "type": "response.incomplete",
+                "response": {
+                    "id": "resp_1",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                    "usage": {
+                        "input_tokens": 12,
+                        "output_tokens": 50,
+                        "total_tokens": 62,
+                        "input_tokens_details": {"cached_tokens": 0},
+                        "output_tokens_details": {"reasoning_tokens": 0},
+                    },
+                },
+            },
+        )
+        service._websocket = ws
+
+        context = MagicMock(spec=LLMContext)
+        await service._receive_response_events(context, [])
+
+        assert "max_output_tokens" in service.push_error.call_args.kwargs["error_msg"]
+        tokens = service.start_llm_usage_metrics.call_args[0][0]
+        assert tokens.prompt_tokens == 12
+        assert tokens.completion_tokens == 50
+
+    @pytest.mark.asyncio
     async def test_response_failed_pushes_error(self):
         service = _make_service()
         service.stop_ttfb_metrics = AsyncMock()
@@ -520,9 +554,8 @@ class TestReceiveResponseEventsErrors:
                 "type": "response.failed",
                 "response": {
                     "id": "resp_1",
-                    "status_details": {
-                        "error": {"message": "Content filter triggered"},
-                    },
+                    "status": "failed",
+                    "error": {"code": "server_error", "message": "The model failed to respond"},
                 },
             },
         )
@@ -531,8 +564,7 @@ class TestReceiveResponseEventsErrors:
         context = MagicMock(spec=LLMContext)
         await service._receive_response_events(context, [])
 
-        service.push_error.assert_called_once()
-        assert "Content filter triggered" in service.push_error.call_args.kwargs["error_msg"]
+        assert "The model failed to respond" in service.push_error.call_args.kwargs["error_msg"]
 
     @pytest.mark.asyncio
     async def test_response_incomplete_pushes_error(self):
@@ -544,7 +576,7 @@ class TestReceiveResponseEventsErrors:
         ws = _ws_events(
             {
                 "type": "response.incomplete",
-                "response": {"id": "resp_1", "status_details": None},
+                "response": {"id": "resp_1", "incomplete_details": None},
             },
         )
         service._websocket = ws
@@ -887,6 +919,38 @@ class TestReasoningParams:
         )
         with patch("pipecat.services.llm_service.logger") as mock_logger:
             self._params(service)
+        mock_logger.info.assert_not_called()
+        mock_logger.warning.assert_not_called()
+
+    def test_use_provider_thinking_default_runs_at_openais_default(self):
+        """The setting sends no default and logs the reason at DEBUG."""
+        service = _make_service(
+            settings=OpenAIResponsesLLMService.Settings(
+                model="gpt-5.5", use_provider_thinking_default=True
+            )
+        )
+        with patch("pipecat.services.llm_service.logger") as mock_logger:
+            params = self._params(service)
+            self._params(service)
+        assert "reasoning" not in params
+        mock_logger.debug.assert_called_once()
+        assert (
+            "use_provider_thinking_default is set, so gpt-5.5 runs"
+            in mock_logger.debug.call_args.args[0]
+        )
+        mock_logger.info.assert_not_called()
+        mock_logger.warning.assert_not_called()
+
+    def test_use_provider_thinking_default_on_a_model_that_doesnt_reason_logs_nothing(self):
+        """A model without reasoning has no default to skip."""
+        service = _make_service(
+            settings=OpenAIResponsesLLMService.Settings(
+                model="gpt-4.1", use_provider_thinking_default=True
+            )
+        )
+        with patch("pipecat.services.llm_service.logger") as mock_logger:
+            self._params(service)
+        mock_logger.debug.assert_not_called()
         mock_logger.info.assert_not_called()
         mock_logger.warning.assert_not_called()
 

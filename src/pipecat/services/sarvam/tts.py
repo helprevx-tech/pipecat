@@ -41,7 +41,6 @@ Both transports serialize language_code without changing public language setting
 or the legacy target_language_code mapping alias.
 """
 
-import asyncio
 import base64
 import json
 from collections.abc import AsyncGenerator
@@ -1066,7 +1065,6 @@ class SarvamTTSService(InterruptibleTTSService):
         self._api_key = api_key
 
         self._receive_task = None
-        self._keepalive_task = None
 
     def can_generate_metrics(self) -> bool:
         """Check if this service can generate processing metrics.
@@ -1154,10 +1152,8 @@ class SarvamTTSService(InterruptibleTTSService):
         if self._websocket and not self._receive_task:
             self._receive_task = self.create_task(self._receive_task_handler(self._report_error))
 
-        if self._websocket and not self._keepalive_task:
-            self._keepalive_task = self.create_task(
-                self._keepalive_task_handler(),
-            )
+        if self._websocket:
+            self._create_keepalive_task(interval=20)
 
     async def _disconnect(self):
         """Disconnect from Sarvam WebSocket and clean up tasks."""
@@ -1167,9 +1163,7 @@ class SarvamTTSService(InterruptibleTTSService):
             await self.cancel_task(self._receive_task)
             self._receive_task = None
 
-        if self._keepalive_task:
-            await self.cancel_task(self._keepalive_task)
-            self._keepalive_task = None
+        await self._cancel_keepalive_task()
 
         await self._disconnect_websocket()
 
@@ -1291,18 +1285,9 @@ class SarvamTTSService(InterruptibleTTSService):
                         context_id, ErrorFrame(error=f"TTS Error: {error_msg}")
                     )
 
-    async def _keepalive_task_handler(self):
-        """Handle keepalive messages to maintain WebSocket connection."""
-        KEEPALIVE_SLEEP = 20
-        while True:
-            await asyncio.sleep(KEEPALIVE_SLEEP)
-            await self._send_keepalive()
-
     async def _send_keepalive(self):
-        """Send keepalive message to maintain connection."""
-        if self._websocket and self._websocket.state == State.OPEN:
-            msg = {"type": "ping"}
-            await self._websocket.send(json.dumps(msg))
+        """Send a ping to keep the connection open through silences."""
+        await self._get_websocket().send(json.dumps({"type": "ping"}))
 
     async def _send_text(self, text: str):
         """Send text only on an open socket, raising when no submission can occur.

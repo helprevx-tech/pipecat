@@ -183,7 +183,18 @@ class AzureBaseTTSService:
             private_endpoint: Custom endpoint URL for Azure Speech Services
                 (e.g., "https://my-resource.cognitiveservices.azure.com/"). Use
                 this when connecting via Private Link or a custom domain.
+
+        Raises:
+            ValueError: If the required subscription key is not a nonempty
+                string. The fixed error never includes credential content.
         """
+        # Both TTS transports require a subscription key; unlike the LLM
+        # services, neither offers a token-provider alternative. Refuse invalid
+        # configuration before retaining it or deferring failure to SDK setup.
+        # Test only emptiness with strip: valid caller keys remain byte-for-byte
+        # unchanged, and errors must never interpolate a supplied credential.
+        if not isinstance(api_key, str) or not api_key.strip():
+            raise ValueError("Azure TTS requires a nonempty subscription key")
         self._api_key = api_key
         self._region = region
         self._private_endpoint = private_endpoint

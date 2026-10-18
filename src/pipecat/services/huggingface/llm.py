@@ -30,6 +30,8 @@ class HuggingFaceLLMService(OpenAILLMService):
 
     Settings = HuggingFaceLLMSettings
     _settings: Settings
+    _requires_api_key = True
+
     supports_developer_role = False
 
     def __init__(

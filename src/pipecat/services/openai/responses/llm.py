@@ -35,6 +35,7 @@ from openai.types.responses import (
     ResponseReasoningSummaryTextDeltaEvent,
     ResponseStreamEvent,
     ResponseTextDeltaEvent,
+    ResponseUsage,
 )
 from pydantic import BaseModel
 from websockets.exceptions import ConnectionClosed
@@ -151,7 +152,8 @@ class OpenAIResponsesLLMSettings(LLMSettings):
         reasoning: Reasoning configuration for reasoning-capable models. ``None``
             (the default) leaves reasoning unconfigured: the service then sends
             the lowest effort OpenAI documents for the model, for the fastest
-            responses, and logs what it sent. Models Pipecat doesn't list run at
+            responses, and logs what it sent. Models Pipecat doesn't list, and
+            any model when ``use_provider_thinking_default`` is set, run at
             OpenAI's default. The default model, ``gpt-4.1``, does not reason.
     """
 
@@ -554,9 +556,10 @@ class _BaseOpenAIResponsesLLMService(LLMService[OpenAIResponsesLLMAdapter]):
 
         Applies the model's entry in ``_THINKING_DEFAULTS``, if it has one. A
         request that already sets ``reasoning``, from the settings or from
-        ``extra``, is left as it is. The first request for each model logs the
-        effort sent or, for a reasoning model that isn't listed, warns that it
-        runs at OpenAI's default.
+        ``extra``, is left as it is. So is every request when
+        ``use_provider_thinking_default`` is set. The first request for each model
+        logs the effort sent, or that the model runs at OpenAI's default,
+        warning for an unlisted reasoning model.
 
         Args:
             params: The response params dict (modified in place).
@@ -1119,6 +1122,22 @@ class OpenAIResponsesLLMService(
             await cleanup()
             raise
 
+    async def _report_event_usage(self, usage: dict | None):
+        """Report the token usage of a response received over the WebSocket."""
+        if not usage:
+            return
+        input_details = usage.get("input_tokens_details") or {}
+        output_details = usage.get("output_tokens_details") or {}
+        tokens = LLMTokenUsage(
+            prompt_tokens=usage.get("input_tokens", 0),
+            completion_tokens=usage.get("output_tokens", 0),
+            total_tokens=usage.get("total_tokens", 0),
+            cache_read_input_tokens=input_details.get("cached_tokens", 0),
+            cache_creation_input_tokens=input_details.get("cache_write_tokens", 0),
+            reasoning_tokens=output_details.get("reasoning_tokens", 0),
+        )
+        await self.start_llm_usage_metrics(tokens)
+
     async def _receive_response_events(
         self, context: LLMContext, full_input: list, output_timeout_secs: float | None = None
     ):
@@ -1230,19 +1249,7 @@ class OpenAIResponsesLLMService(
 
             elif event_type == "response.completed":
                 response = event.get("response", {})
-                usage = response.get("usage")
-                if usage:
-                    input_details = usage.get("input_tokens_details") or {}
-                    output_details = usage.get("output_tokens_details") or {}
-                    tokens = LLMTokenUsage(
-                        prompt_tokens=usage.get("input_tokens", 0),
-                        completion_tokens=usage.get("output_tokens", 0),
-                        total_tokens=usage.get("total_tokens", 0),
-                        cache_read_input_tokens=input_details.get("cached_tokens", 0),
-                        cache_creation_input_tokens=input_details.get("cache_write_tokens", 0),
-                        reasoning_tokens=output_details.get("reasoning_tokens", 0),
-                    )
-                    await self.start_llm_usage_metrics(tokens)
+                await self._report_event_usage(response.get("usage"))
 
                 self._full_model_name = response.get("model")
 
@@ -1258,9 +1265,13 @@ class OpenAIResponsesLLMService(
 
             elif event_type in ("response.failed", "response.incomplete"):
                 response = event.get("response", {})
-                status_details = response.get("status_details") or {}
-                error_info = status_details.get("error") or {}
-                error_msg = error_info.get("message", f"Response {event_type.split('.')[-1]}")
+                # A response cut short or failed is still billed for its tokens.
+                await self._report_event_usage(response.get("usage"))
+                error_msg = (
+                    (response.get("error") or {}).get("message")
+                    or (response.get("incomplete_details") or {}).get("reason")
+                    or f"Response {event_type.split('.')[-1]}"
+                )
                 await self.push_error(error_msg=f"LLM response error: {error_msg}")
                 break
 
@@ -1337,6 +1348,31 @@ class OpenAIResponsesHttpLLMService(_BaseOpenAIResponsesLLMService):
                 await self.push_frame(LLMFullResponseEndFrame())
         else:
             await self.push_frame(frame, direction)
+
+    async def _report_usage(self, usage: ResponseUsage | None):
+        """Report a response's token usage, if it carries any."""
+        if not usage:
+            return
+        # Third-party Responses API servers may omit fields the
+        # OpenAI SDK treats as required. The SDK's lenient
+        # streaming decoder leaves anything omitted as None — at
+        # the top level (token counts), as a missing detail
+        # sub-object, or as a missing field inside one. Coalesce
+        # each to 0 so a partial usage payload can't raise or
+        # leak None into metrics.
+        input_details = usage.input_tokens_details
+        output_details = usage.output_tokens_details
+        tokens = LLMTokenUsage(
+            prompt_tokens=usage.input_tokens or 0,
+            completion_tokens=usage.output_tokens or 0,
+            total_tokens=usage.total_tokens or 0,
+            cache_read_input_tokens=(input_details.cached_tokens or 0) if input_details else 0,
+            cache_creation_input_tokens=(getattr(input_details, "cache_write_tokens", None) or 0)
+            if input_details
+            else 0,
+            reasoning_tokens=(output_details.reasoning_tokens or 0) if output_details else 0,
+        )
+        await self.start_llm_usage_metrics(tokens)
 
     async def _create_stream(self, params: dict) -> AsyncStream[ResponseStreamEvent]:
         """Open a streaming Responses API request, retrying once on timeout.
@@ -1464,41 +1500,15 @@ class OpenAIResponsesHttpLLMService(_BaseOpenAIResponsesLLMService):
 
                 elif isinstance(event, ResponseCompletedEvent):
                     response = event.response
-                    if response.usage:
-                        usage = response.usage
-                        # Third-party Responses API servers may omit fields the
-                        # OpenAI SDK treats as required. The SDK's lenient
-                        # streaming decoder leaves anything omitted as None — at
-                        # the top level (token counts), as a missing detail
-                        # sub-object, or as a missing field inside one. Coalesce
-                        # each to 0 so a partial usage payload can't raise or
-                        # leak None into metrics.
-                        input_details = usage.input_tokens_details
-                        output_details = usage.output_tokens_details
-                        tokens = LLMTokenUsage(
-                            prompt_tokens=usage.input_tokens or 0,
-                            completion_tokens=usage.output_tokens or 0,
-                            total_tokens=usage.total_tokens or 0,
-                            cache_read_input_tokens=(input_details.cached_tokens or 0)
-                            if input_details
-                            else 0,
-                            cache_creation_input_tokens=(
-                                getattr(input_details, "cache_write_tokens", None) or 0
-                            )
-                            if input_details
-                            else 0,
-                            reasoning_tokens=(output_details.reasoning_tokens or 0)
-                            if output_details
-                            else 0,
-                        )
-                        await self.start_llm_usage_metrics(tokens)
+                    await self._report_usage(response.usage)
 
                     # This field is used by @traced_llm for more detailed
                     # model name in tracing spans
                     self._full_model_name = response.model
 
                 elif isinstance(event, ResponseFailedEvent):
-                    # As with usage above, the detail objects and their fields
+                    await self._report_usage(event.response.usage)
+                    # As with usage, the detail objects and their fields
                     # are only as reliable as the server; coalesce to a generic
                     # message so a sparse payload still reports something.
                     error = event.response.error
@@ -1510,6 +1520,7 @@ class OpenAIResponsesHttpLLMService(_BaseOpenAIResponsesLLMService):
                     break
 
                 elif isinstance(event, ResponseIncompleteEvent):
+                    await self._report_usage(event.response.usage)
                     details = event.response.incomplete_details
                     reason = details.reason if details else None
                     await self.push_error(

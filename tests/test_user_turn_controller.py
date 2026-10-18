@@ -9,6 +9,8 @@ import unittest
 import warnings
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from pipecat.audio.turn.base_turn_analyzer import EndOfTurnState
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
@@ -811,7 +813,7 @@ class TestUserTurnController(unittest.IsolatedAsyncioTestCase):
         """
         resets = 0
 
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
 
             class LegacyStart(VADUserTurnStartStrategy):
                 async def reset(self):  # the deprecated hook
@@ -832,7 +834,7 @@ class TestUserTurnController(unittest.IsolatedAsyncioTestCase):
         """A stop strategy's reset() is bridged on both turn boundaries (armed, then cleaned)."""
         resets = 0
 
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
 
             class LegacyStop(ExternalUserTurnCompletionStopStrategy):
                 async def reset(self):  # the deprecated hook
@@ -846,7 +848,7 @@ class TestUserTurnController(unittest.IsolatedAsyncioTestCase):
 
     async def test_overriding_reset_warns_at_class_definition(self):
         """Overriding the deprecated reset() warns when the class is defined."""
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
 
             class LegacyStop(ExternalUserTurnCompletionStopStrategy):
                 async def reset(self):
@@ -878,7 +880,7 @@ class TestUserTurnController(unittest.IsolatedAsyncioTestCase):
         """
         reset_calls = 0
 
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
 
             class MyMinWords(MinWordsUserTurnStartStrategy):
                 async def reset(self):

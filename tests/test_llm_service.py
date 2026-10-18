@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
+import pytest
 from loguru import logger
 
 from pipecat.adapters.base_llm_adapter import BaseLLMAdapter
@@ -1411,7 +1412,7 @@ class TestAsyncToolCancellationExposure(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self._advertised(service), set())
 
     def test_deprecated_flag_covers_every_async_tool(self):
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             service = MockLLMService(enable_async_tool_cancellation=True)
         service.register_function(
             "get_current_weather", self._handler, cancel_on_interruption=False
@@ -1420,7 +1421,7 @@ class TestAsyncToolCancellationExposure(unittest.IsolatedAsyncioTestCase):
         self.assertIn(cancel_tool_name("get_current_weather"), self._advertised(service))
 
     def test_deprecated_flag_needs_an_async_tool(self):
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             service = MockLLMService(enable_async_tool_cancellation=True)
         self._sync(service)
         self.assertEqual(self._advertised(service), set())
@@ -1500,14 +1501,24 @@ class TestTurnCompletionSettingsDeprecation(unittest.IsolatedAsyncioTestCase):
     """
 
     def test_filter_incomplete_user_turns_at_construction_warns(self):
-        with self.assertWarns(DeprecationWarning) as ctx:
+        with pytest.warns(DeprecationWarning) as ctx:
             MockLLMService(filter_incomplete_user_turns=True)
-        self.assertIn("FilterIncompleteUserTurnStrategies", str(ctx.warning))
+        self.assertIn(
+            "FilterIncompleteUserTurnStrategies",
+            str(
+                next(item.message for item in ctx if issubclass(item.category, DeprecationWarning))
+            ),
+        )
 
     def test_user_turn_completion_config_at_construction_warns(self):
-        with self.assertWarns(DeprecationWarning) as ctx:
+        with pytest.warns(DeprecationWarning) as ctx:
             MockLLMService(user_turn_completion_config=UserTurnCompletionConfig())
-        self.assertIn("FilterIncompleteUserTurnStrategies(config=...)", str(ctx.warning))
+        self.assertIn(
+            "FilterIncompleteUserTurnStrategies(config=...)",
+            str(
+                next(item.message for item in ctx if issubclass(item.category, DeprecationWarning))
+            ),
+        )
 
     def test_construction_without_the_settings_is_silent(self):
         with warnings.catch_warnings():

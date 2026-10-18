@@ -20,6 +20,8 @@ class SpeachesLLMSettings(OpenAILLMSettings):
 class SpeachesLLMService(OpenAILLMService):
     """Speaches LLM service using an OpenAI-compatible chat completions endpoint."""
 
+    _requires_api_key = True
+
     Settings = SpeachesLLMSettings
 
     def __init__(

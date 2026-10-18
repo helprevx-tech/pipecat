@@ -9,6 +9,7 @@ import unittest
 import warnings
 from pathlib import Path
 
+import pytest
 from loguru import logger
 
 from pipecat.evals.scenario import (
@@ -72,10 +73,13 @@ class TestScenarioGroups(unittest.TestCase):
         self.assertEqual([s.name for s in scenarios], ["greet/greet"])
 
     def test_a_flat_file_is_deprecated_and_keeps_its_name(self):
-        with self.assertWarns(DeprecationWarning) as cm:
+        with pytest.warns(DeprecationWarning) as cm:
             scenarios = EvalScenarioFile.load(_write("name: greet\nturns: [{user: hi}]\n"))
         self.assertEqual([s.name for s in scenarios], ["greet"])
-        self.assertIn("`scenarios:` list", str(cm.warning))
+        self.assertIn(
+            "`scenarios:` list",
+            str(next(item.message for item in cm if issubclass(item.category, DeprecationWarning))),
+        )
 
     def test_entries_are_named_under_the_group(self):
         scenarios = EvalScenarioFile.load(_write(GROUP))
@@ -128,22 +132,22 @@ class TestScenarioGroups(unittest.TestCase):
         self.assertIn("no scenario called 'turn_completion/nope'", str(cm.exception))
 
     def test_the_class_loaders_are_deprecated(self):
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             scenario = EvalScriptScenario.load(_write("name: greet\nturns: [{user: hi}]\n"))
         self.assertEqual(scenario.name, "greet")
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             simulation = EvalSimulationScenario.load(
                 _write("name: s\npersona: p\ngoal: g\nsuccess: s\n")
             )
         self.assertEqual(simulation.goal, "g")
 
     def test_load_scenario_file_is_deprecated_and_wants_a_lone_scenario(self):
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             scenario = load_scenario_file(
                 _write("name: greet\nscenarios:\n  - name: greet\n    turns: [{user: hi}]\n")
             )
         self.assertEqual(scenario.name, "greet/greet")
-        with self.assertWarns(DeprecationWarning), self.assertRaises(ValueError) as cm:
+        with pytest.warns(DeprecationWarning), self.assertRaises(ValueError) as cm:
             load_scenario_file(_write(GROUP))
         self.assertIn("holds 2 scenarios", str(cm.exception))
 
@@ -268,6 +272,32 @@ class TestEvalsScenarioParser(unittest.TestCase):
         )
         self.assertTrue(s.user_audio)
         self.assertEqual(s.user_speech, {"service": "cartesia", "voice": "v1"})
+
+    def test_user_turn_with_pauses(self):
+        s = _script(
+            _write(
+                "name: a\n"
+                "user: {modality: audio, speech: {service: kokoro, voice: v1}}\n"
+                "turns:\n"
+                "  - user: ['So last week I went to', {pause_ms: 2000}, 'Spain.']\n"
+            )
+        )
+        turn = s.turns[0]
+        self.assertEqual(turn.user, "So last week I went to Spain.")
+        self.assertEqual(turn.parts, ["So last week I went to", 2000, "Spain."])
+
+    def test_user_turn_pauses_are_validated(self):
+        audio = "user: {modality: audio, speech: {service: kokoro, voice: v1}}\n"
+        cases = {
+            "pauses but no text": audio + "turns: [{user: [{pause_ms: 500}]}]\n",
+            "items must be text": audio + "turns: [{user: ['Hi', {pause_ms: 0}]}]\n",
+            "text modality": "turns: [{user: ['Hi', {pause_ms: 500}, 'there']}]\n",
+        }
+        for message, body in cases.items():
+            with self.subTest(message=message):
+                with self.assertRaises(ValueError) as cm:
+                    _script(_write("name: a\n" + body))
+                self.assertIn(message, str(cm.exception))
 
     def test_user_audio_requires_speech(self):
         with self.assertRaises(ValueError) as cm:
@@ -977,10 +1007,13 @@ class TestTurnAudioFile(unittest.TestCase):
 class TestDeprecatedTriggerDisconnect(unittest.TestCase):
     def test_the_field_is_deprecated_and_still_read(self):
         path = _write("name: t\ntrigger_disconnect: true\nturns: [{user: hi}]\n")
-        with self.assertWarns(DeprecationWarning) as cm:
+        with pytest.warns(DeprecationWarning) as cm:
             scenario = _script(path)
         self.assertTrue(scenario.trigger_disconnect)
-        self.assertIn("`trigger_disconnect:`", str(cm.warning))
+        self.assertIn(
+            "`trigger_disconnect:`",
+            str(next(item.message for item in cm if issubclass(item.category, DeprecationWarning))),
+        )
 
     def test_a_scenario_without_it_does_not_warn(self):
         path = _write("name: t\nturns: [{user: hi}]\n")

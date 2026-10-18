@@ -13,10 +13,11 @@ from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     CancelFrame,
+    EndFrame,
     InterruptionFrame,
+    StartFrame,
     UserMuteStartedFrame,
     UserMuteStoppedFrame,
-    StartFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
 )
@@ -29,6 +30,39 @@ from pipecat.tests.utils import SleepFrame, run_test
 
 class TestTurnTrackingObserver(unittest.IsolatedAsyncioTestCase):
     """Tests for TurnTrackingObserver."""
+
+    async def test_terminal_recording_notification_keeps_current_tracing_turn(self):
+        """End/cancel expose the final turn for recording without ending or clearing its tracing owner."""
+        for terminal in (EndFrame, CancelFrame):
+            with self.subTest(terminal=terminal.__name__):
+                observer = TurnTrackingObserver()
+                processor = IdentityFilter()
+                recording, ended = [], []
+
+                @observer.event_handler("on_pipeline_ended")
+                async def recording_stopped(_observer, turn_number, _recording=recording):
+                    _recording.append(turn_number)
+
+                @observer.event_handler("on_turn_ended")
+                async def turn_ended(_observer, turn_number, _duration, _interrupted, _ended=ended):
+                    _ended.append(turn_number)
+
+                for timestamp, frame in enumerate((StartFrame(), terminal()), start=1):
+                    await observer.on_push_frame(
+                        FramePushed(
+                            source=processor,
+                            destination=processor,
+                            frame=frame,
+                            direction=FrameDirection.DOWNSTREAM,
+                            timestamp=timestamp,
+                        )
+                    )
+                self.assertEqual(recording, [1])
+                self.assertEqual(ended, [])
+                self.assertEqual(observer._turn_count, 1)
+                self.assertTrue(observer._is_turn_active)
+                self.assertIsNone(observer._end_turn_timer)
+                await observer.cleanup()
 
     async def test_noninterrupting_overlap_waits_for_both_speakers(self):
         observer = TurnTrackingObserver(turn_end_timeout_secs=0.02)

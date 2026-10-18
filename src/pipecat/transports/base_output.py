@@ -183,7 +183,7 @@ class BaseOutputTransport(FrameProcessor):
             or not all(
                 callable(callback)
                 and not inspect.iscoroutinefunction(callback)
-                and not inspect.iscoroutinefunction(getattr(callback, "__call__", None))
+                and not inspect.iscoroutinefunction(getattr(callback, "__call__", None))  # noqa: B004 - callable-object coroutine inspection, not a callability test
                 for callback in (
                     policy.capture,
                     policy.copy,

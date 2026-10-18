@@ -4,7 +4,9 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+import re
 import unittest
+import warnings
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -218,17 +220,26 @@ class TestAICQuailVADAnalyzer(unittest.IsolatedAsyncioTestCase):
             ("minimum_speech_duration", 0.05),
             ("sensitivity", 0.7),
         ):
-            # assertWarnsRegex also pins the message to the specific param name,
-            # so a regression that warns with the wrong param name is caught.
-            with self.assertWarnsRegex(DeprecationWarning, param):
+            # Direct local capture avoids unittest's unrelated sys.modules
+            # warning-registry scan (which can load optional lazy SDK modules).
+            # The SAME record must retain both the original category/subclass
+            # and param-regex semantics; no warning is suppressed or fabricated.
+            with warnings.catch_warnings(record=True) as captured:
+                warnings.simplefilter("always", DeprecationWarning)
                 analyzer, _ = self._create_analyzer(**{param: value})
+            self.assertTrue(
+                any(
+                    issubclass(item.category, DeprecationWarning)
+                    and re.search(param, str(item.message))
+                    for item in captured
+                ),
+                "Expected the original parameter-specific DeprecationWarning",
+            )
             # Accepted-but-ignored: not stashed anywhere on the instance.
             self.assertFalse(hasattr(analyzer, f"_pending_{param}"))
 
     def test_no_deprecation_warning_without_legacy_params(self):
         """Constructing without the legacy params emits no DeprecationWarning."""
-        import warnings
-
         with warnings.catch_warnings():
             warnings.simplefilter("error", DeprecationWarning)
             analyzer, _ = self._create_analyzer()  # must not raise

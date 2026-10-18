@@ -10,8 +10,9 @@ These tests drive the service's audio/turn handlers directly with a fake
 ``send_client_event`` and assert on the client events emitted to the service.
 They cover the manual turn-detection (server-VAD-disabled) pre-roll behavior —
 audio is appended to the input buffer and mirrored into a rolling pre-roll
-buffer that is replayed after an interruption clears the input buffer — and the
-server-VAD-enabled path, where no pre-roll is maintained.
+buffer that is replayed after an interruption clears the input buffer — the
+server-VAD-enabled path, where no pre-roll is maintained, and resampling of
+pipeline audio to the session's fixed 24 kHz input rate.
 """
 
 import base64
@@ -27,6 +28,9 @@ from pipecat.services.openai.realtime import events
 from pipecat.services.openai.realtime.events import (
     AudioConfiguration,
     AudioInput,
+    PCMAAudioFormat,
+    PCMAudioFormat,
+    PCMUAudioFormat,
     SessionProperties,
 )
 from pipecat.services.openai.realtime.llm import (
@@ -166,11 +170,11 @@ async def test_manual_mode_preroll_capped_to_default_window():
     """Before VAD params are known, the pre-roll keeps DEFAULT_USER_AUDIO_PREROLL_SECS."""
     service, _ = _make_service(manual_turn_detection=True)
 
-    # 1s at 16kHz mono / 16-bit = 32000 bytes; buffer should keep the most
-    # recent 0.5s = 16000 bytes.
-    await service._send_user_audio(_audio_frame(sample_rate=16000, data=bytes(32000)))
+    # 1s at 24kHz mono / 16-bit = 48000 bytes; buffer should keep the most
+    # recent 0.5s = 24000 bytes.
+    await service._send_user_audio(_audio_frame(data=bytes(48000)))
 
-    assert len(service._user_audio_preroll_buffer) == 16000
+    assert len(service._user_audio_preroll_buffer) == 24000
 
 
 @pytest.mark.asyncio
@@ -184,10 +188,10 @@ async def test_manual_mode_preroll_sized_from_vad_start_secs():
     )
     # Send 2s of audio — comfortably more than the window — so the buffer is
     # capped to (start_secs + margin), not limited by how much we sent.
-    await service._send_user_audio(_audio_frame(sample_rate=16000, data=bytes(64000)))
+    await service._send_user_audio(_audio_frame(data=bytes(96000)))
 
-    # 16kHz mono / 16-bit = 2 bytes/sample.
-    expected = int(16000 * 1 * 2 * (start_secs + AUTOSIZED_USER_AUDIO_PREROLL_MARGIN_SECS))
+    # 24kHz mono / 16-bit = 2 bytes/sample.
+    expected = int(24000 * 1 * 2 * (start_secs + AUTOSIZED_USER_AUDIO_PREROLL_MARGIN_SECS))
     assert len(service._user_audio_preroll_buffer) == expected
 
 
@@ -199,10 +203,10 @@ async def test_manual_mode_preroll_override_pins_value_and_ignores_vad_params():
     service._handle_speech_control_params(
         SpeechControlParamsFrame(vad_params=VADParams(start_secs=0.5))
     )
-    # 0.1s at 16kHz mono / 16-bit = 3200 bytes.
-    await service._send_user_audio(_audio_frame(sample_rate=16000, data=bytes(32000)))
+    # 0.1s at 24kHz mono / 16-bit = 4800 bytes.
+    await service._send_user_audio(_audio_frame(data=bytes(48000)))
 
-    assert len(service._user_audio_preroll_buffer) == 3200
+    assert len(service._user_audio_preroll_buffer) == 4800
 
 
 # ---------------------------------------------------------------------------
@@ -232,3 +236,89 @@ async def test_server_mode_interruption_does_not_clear_or_replay():
 
     assert "InputAudioBufferClearEvent" not in recorder.kinds()
     assert "ResponseCancelEvent" not in recorder.kinds()
+
+
+# ---------------------------------------------------------------------------
+# Resampling to the session's 24 kHz input rate
+# ---------------------------------------------------------------------------
+
+
+async def _send_one_second(service, sample_rate: int):
+    """Send 1s of audio in 20ms frames, the way an input transport delivers it."""
+    frame_bytes = sample_rate * 2 // 50
+    for _ in range(50):
+        await service._send_user_audio(
+            _audio_frame(sample_rate=sample_rate, data=b"\x01\x02" * (frame_bytes // 2))
+        )
+
+
+@pytest.mark.asyncio
+async def test_pipeline_audio_is_resampled_to_24khz():
+    """16 kHz pipeline audio reaches the input buffer as 24 kHz audio."""
+    service, recorder = _make_service(manual_turn_detection=False)
+
+    await _send_one_second(service, 16000)
+
+    sent = sum(len(base64.b64decode(p)) for p in recorder.append_payloads())
+    # 1s at 24kHz is 48000 bytes, less what the streaming resampler still holds.
+    assert 46000 <= sent <= 48000
+
+
+@pytest.mark.asyncio
+async def test_preroll_holds_resampled_audio():
+    """The pre-roll holds 24 kHz audio, sized at 24 kHz, whatever the pipeline rate."""
+    service, _ = _make_service(manual_turn_detection=True)
+
+    await _send_one_second(service, 16000)
+
+    # The default 0.5s window at 24kHz mono / 16-bit.
+    assert len(service._user_audio_preroll_buffer) == 24000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("audio_format", [PCMUAudioFormat(), PCMAAudioFormat()])
+async def test_encoded_g711_keeps_submitted_bytes_and_actual_preroll_duration(audio_format):
+    """Explicit telephony encodings bypass PCM resampling and replay only their actual half-second of one-byte samples."""
+    service, recorder = _make_service(manual_turn_detection=True)
+    service._settings.session_properties.audio.input.format = audio_format
+    service._input_resampler.resample = AsyncMock(
+        side_effect=AssertionError("Encoded telephony bytes must not enter the PCM resampler")
+    )
+    source = b"\x80" * 8000
+    await service._send_user_audio(_audio_frame(sample_rate=8000, data=source))
+    assert recorder.append_payloads() == [base64.b64encode(source).decode()]
+    assert bytes(service._user_audio_preroll_buffer) == source[-4000:]
+    await service._handle_interruption()
+    assert base64.b64decode(recorder.append_payloads()[-1]) == source[-4000:]
+    service._input_resampler.resample.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sample_rate", [8000, OPENAI_SAMPLE_RATE])
+async def test_explicit_pcm_preroll_uses_the_submitted_24khz_bytes(sample_rate):
+    """Explicit PCM preserves the same resampled duration as an omitted format at narrowband and native rates."""
+    service, recorder = _make_service(manual_turn_detection=True)
+    service._settings.session_properties.audio.input.format = PCMAudioFormat()
+    await _send_one_second(service, sample_rate)
+    sent = b"".join(base64.b64decode(payload) for payload in recorder.append_payloads())
+    assert 46000 <= len(sent) <= 48000
+    assert bytes(service._user_audio_preroll_buffer) == sent[-24000:]
+
+
+@pytest.mark.asyncio
+async def test_zero_preroll_window_keeps_no_audio():
+    """An explicit zero window never invokes Python's negative-zero slice and accumulates no retained speech."""
+    service, recorder = _make_service(manual_turn_detection=True, preroll_secs=0)
+    await _send_one_second(service, OPENAI_SAMPLE_RATE)
+    assert recorder.append_payloads()
+    assert service._user_audio_preroll_buffer == bytearray()
+
+
+@pytest.mark.asyncio
+async def test_empty_resampler_result_never_appends_or_changes_preroll():
+    """A streaming resampler holding a partial frame submits no empty event or unconverted input bytes."""
+    service, recorder = _make_service(manual_turn_detection=True)
+    service._input_resampler.resample = AsyncMock(return_value=b"")
+    await service._send_user_audio(_audio_frame(sample_rate=8000, data=b"\x01\x02"))
+    assert recorder.append_payloads() == []
+    assert service._user_audio_preroll_buffer == bytearray()

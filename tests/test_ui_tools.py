@@ -18,6 +18,8 @@ import unittest
 import warnings
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from pipecat.bus.ui.messages import BusUICommandMessage
 from pipecat.workers.llm.tool_decorator import _collect_tools
 from pipecat.workers.ui import ReplyToolMixin, UIWorker
@@ -156,7 +158,7 @@ class TestUIWorkerActionHelpers(unittest.IsolatedAsyncioTestCase):
 
 class TestReplyToolMixin(unittest.IsolatedAsyncioTestCase):
     async def test_composing_the_mixin_warns(self):
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
 
             class _Composed(ReplyToolMixin, UIWorker):
                 pass

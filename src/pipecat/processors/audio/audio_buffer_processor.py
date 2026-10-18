@@ -453,7 +453,7 @@ class AudioBufferProcessor(FrameProcessor):
             self._bot_turn_audio_buffer.extend(resampled_audio)
 
     def _attach_turn_tracker(self):
-        """Emit turn audio when the pipeline's turn tracker ends a turn."""
+        """Emit audio at ordered turn boundaries or pipeline stop without changing tracing ownership."""
         if self._turn_tracker_attached:
             return
 
@@ -468,6 +468,11 @@ class AudioBufferProcessor(FrameProcessor):
 
         @turn_tracker.event_handler("on_turn_ended")
         async def on_turn_ended(tracker, turn_number: int, duration: float, interrupted: bool):
+            await self._emit_turn_audio(turn_number)
+
+        @turn_tracker.event_handler("on_pipeline_ended")
+        async def on_pipeline_ended(tracker, turn_number: int):
+            """Flush captured final audio without ending the still-owned tracing turn."""
             await self._emit_turn_audio(turn_number)
 
         self._turn_tracker_attached = True

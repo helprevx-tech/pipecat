@@ -10,6 +10,8 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock
 
+import pytest
+
 from pipecat.frames.frames import LLMContextSummaryRequestFrame
 from pipecat.processors.aggregators.llm_context import LLMContext, LLMSpecificMessage
 from pipecat.services.llm_service import LLMService
@@ -335,7 +337,7 @@ class TestLLMContextSummarizationConfigDeprecated(unittest.TestCase):
 
     def test_emits_deprecation_warning(self):
         """Test that instantiating the deprecated config emits a DeprecationWarning."""
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             LLMContextSummarizationConfig()
 
     def test_to_auto_config(self):

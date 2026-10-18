@@ -111,11 +111,13 @@ class PiperTTSService(TTSService):
             **kwargs,
         )
 
+        # Reject invalid configuration before creating cache directories or
+        # downloading/loading a model; read-only hosts must get the same error.
+        _voice = require_given(self._settings.voice, "Piper TTS voice")
         download_dir = download_dir or PIPER_CACHE_DIR
         if not download_dir.exists():
             download_dir.mkdir(parents=True, exist_ok=True)
 
-        _voice = require_given(self._settings.voice, "Piper TTS voice")
         model_file = f"{_voice}.onnx"
         model_path_resolved = download_dir / model_file
 

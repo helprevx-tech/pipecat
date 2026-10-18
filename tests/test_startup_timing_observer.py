@@ -3,6 +3,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from pipecat.frames.frames import (
     BotConnectedFrame,
     ClientConnectedFrame,
@@ -299,7 +301,7 @@ class TestStartupTimingObserver(unittest.IsolatedAsyncioTestCase):
             await observer.on_processor_setup(
                 ProcessorSetUp(processor=processor, started_at_ns=0, finished_at_ns=_ns(0.2))
             )
-            with self.assertWarns(DeprecationWarning):
+            with pytest.warns(DeprecationWarning):
                 await observer.on_startup_warmup(
                     StartupWarmup(started_at_ns=0, finished_at_ns=_ns(0.5))
                 )
@@ -330,7 +332,7 @@ class TestStartupTimingObserver(unittest.IsolatedAsyncioTestCase):
             await observer.on_processor_setup(
                 ProcessorSetUp(processor=processor, started_at_ns=0, finished_at_ns=_ns(0.5))
             )
-            with self.assertWarns(DeprecationWarning):
+            with pytest.warns(DeprecationWarning):
                 await observer.on_startup_warmup(
                     StartupWarmup(started_at_ns=0, finished_at_ns=_ns(0.2))
                 )

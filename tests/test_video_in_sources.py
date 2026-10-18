@@ -8,6 +8,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
+import pytest
 from pydantic import ValidationError
 
 from pipecat.frames.frames import UserImageRawFrame, UserImageRequestFrame
@@ -674,7 +675,7 @@ class TestCaptureParticipantVideo(unittest.IsolatedAsyncioTestCase):
         transport, capture = self._smallwebrtc()
 
         await transport.capture_participant_video("pc-1", on_request_only=True)
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             await transport.capture_participant_video("pc-1", 0, "screenVideo")
 
         self.assertEqual(
@@ -698,7 +699,7 @@ class TestCaptureParticipantVideo(unittest.IsolatedAsyncioTestCase):
             input._client.capture_participant_video = AsyncMock()
 
             await cls.capture_participant_video(input, "p1", on_request_only=True)
-            with self.assertWarns(DeprecationWarning):
+            with pytest.warns(DeprecationWarning):
                 await cls.capture_participant_video(input, "p2", 0)
 
             for participant in ("p1", "p2"):
@@ -708,9 +709,9 @@ class TestCaptureParticipantVideo(unittest.IsolatedAsyncioTestCase):
     async def test_smallwebrtc_calls_without_a_participant_keep_their_meaning(self):
         transport, capture = self._smallwebrtc()
 
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             await transport.capture_participant_video(video_source="screenVideo")
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             await transport.capture_participant_video("camera", 1)
 
         self.assertEqual(

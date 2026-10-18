@@ -9,6 +9,8 @@ import unittest
 import warnings
 from unittest.mock import patch
 
+import pytest
+
 from pipecat.frames.frames import (
     InterimTranscriptionFrame,
     ProposedUserStartedSpeakingFrame,
@@ -1115,12 +1117,19 @@ class TestBaseUserTurnStopStrategyDeprecations(unittest.IsolatedAsyncioTestCase)
         return captured
 
     async def test_enable_user_speaking_frames_warns(self):
-        with self.assertWarns(DeprecationWarning) as caught:
+        with pytest.warns(DeprecationWarning) as caught:
             BaseUserTurnStopStrategy(enable_user_speaking_frames=False)
-        self.assertIn("enable_user_speaking_frames", str(caught.warning))
+        self.assertIn(
+            "enable_user_speaking_frames",
+            str(
+                next(
+                    item.message for item in caught if issubclass(item.category, DeprecationWarning)
+                )
+            ),
+        )
 
     async def test_enable_user_speaking_frames_applies(self):
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             strategy = BaseUserTurnStopStrategy(enable_user_speaking_frames=False)
         captured = await self._capture_params(strategy)
 

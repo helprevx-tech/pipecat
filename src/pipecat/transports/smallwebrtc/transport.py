@@ -153,7 +153,7 @@ class RawAudioTrack(AudioStreamTrack):
             and any(
                 not callable(callback)
                 or inspect.iscoroutinefunction(callback)
-                or inspect.iscoroutinefunction(getattr(callback, "__call__", None))
+                or inspect.iscoroutinefunction(getattr(callback, "__call__", None))  # noqa: B004 - callable-object coroutine inspection, not a callability test
                 for callback in (context_is_current, native_silence_context)
             )
         ):
@@ -627,7 +627,7 @@ class SmallWebRTCClient:
         if any(
             not callable(callback)
             or inspect.iscoroutinefunction(callback)
-            or inspect.iscoroutinefunction(getattr(callback, "__call__", None))
+            or inspect.iscoroutinefunction(getattr(callback, "__call__", None))  # noqa: B004 - callable-object coroutine inspection, not a callability test
             for callback in (capture, is_current, native_context)
         ):
             raise TypeError("Audio output callbacks must be synchronous callables")
@@ -1332,7 +1332,7 @@ class SmallWebRTCTransport(BaseTransport):
         """
         if not self._output:
             self._output = SmallWebRTCOutputTransport(
-                self._client, self._params, name=self._input_name
+                self._client, self._params, name=self._output_name
             )
         return self._output
 

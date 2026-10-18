@@ -788,14 +788,15 @@ class TestAudioOutputPolicy(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(sender._bot_speaking)
             self.assertFalse(sender._audio_queue.has_frame(OutputAudioRawFrame))
             stops = [
-                frame for frame, _ in transport.forwarded
+                frame
+                for frame, _ in transport.forwarded
                 if isinstance(frame, BotStoppedSpeakingFrame)
             ]
             self.assertEqual(len(stops), 2)
             self.assertTrue(all(frame.interrupted for frame in stops))
-            self.assertTrue(all(
-                frame.interruption_id == interruption.interruption_id for frame in stops
-            ))
+            self.assertTrue(
+                all(frame.interruption_id == interruption.interruption_id for frame in stops)
+            )
         finally:
             release.set()
 
@@ -824,7 +825,9 @@ class TestAudioOutputPolicy(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(0.25):
             while not any(frame is current for frame, _ in transport.forwarded):
                 await asyncio.sleep(0.001)
-        self.assertFalse(any(frame is pending or frame is queued for frame, _ in transport.forwarded))
+        self.assertFalse(
+            any(frame is pending or frame is queued for frame, _ in transport.forwarded)
+        )
         await asyncio.wait_for(sender._clock_queue.join(), timeout=0.25)
 
     async def test_cancelled_clock_wait_is_acknowledged_once_across_restarts(self):

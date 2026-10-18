@@ -8,6 +8,8 @@ import json
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from pipecat.evals.serializer import EvalConnectionFlags, eval_connect_message
 from pipecat.runner.types import (
     CallData,
@@ -374,7 +376,7 @@ class TestGetTransportClientId(unittest.TestCase):
         transport = MagicMock()
         transport.get_client_id.return_value = "User-1234"
 
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             client_id = get_transport_client_id(transport, {"id": "User-1234"})
 
         self.assertEqual(client_id, "User-1234")
@@ -386,7 +388,7 @@ class TestMaybeCaptureParticipantVideo(unittest.IsolatedAsyncioTestCase):
         class OtherTransport:
             pass
 
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             await maybe_capture_participant_camera(OtherTransport(), {"id": "User-1234"})
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             await maybe_capture_participant_screen(OtherTransport(), {"id": "User-1234"})

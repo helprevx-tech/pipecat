@@ -1426,7 +1426,8 @@ class OpenAIRealtimeLLMService(LLMService[OpenAIRealtimeLLMAdapter]):
                 frame.vad_params.start_secs + AUTOSIZED_USER_AUDIO_PREROLL_MARGIN_SECS
             )
 
-    async def _send_user_audio(self, frame):
+    async def _send_user_audio(self, frame: InputAudioRawFrame):
+        """Submit the configured format once and retain exactly those bytes for manual-turn replay."""
         session_properties = assert_given(self._settings.session_properties)
         input_audio = (
             session_properties.audio.input
@@ -1453,11 +1454,17 @@ class OpenAIRealtimeLLMService(LLMService[OpenAIRealtimeLLMAdapter]):
         # after clearing the input buffer. (Server-side turn detection never
         # clears it, so no buffer is needed.)
         if self._is_turn_detection_disabled():
-            self._user_audio_preroll_buffer.extend(frame.audio)
+            # Replay submitted bytes: PCM was resampled above, while explicit
+            # G.711 retains its original one-byte samples and transport rate.
+            self._user_audio_preroll_buffer.extend(payload_audio)
+            rate = OPENAI_SAMPLE_RATE if configured_format == "audio/pcm" else frame.sample_rate
+            sample_width = 2 if configured_format == "audio/pcm" else 1
             preroll_len = int(
-                frame.sample_rate * frame.num_channels * 2 * self._user_audio_preroll_secs
+                rate * frame.num_channels * sample_width * self._user_audio_preroll_secs
             )
-            self._user_audio_preroll_buffer = self._user_audio_preroll_buffer[-preroll_len:]
+            self._user_audio_preroll_buffer = (
+                self._user_audio_preroll_buffer[-preroll_len:] if preroll_len > 0 else bytearray()
+            )
 
     async def _replay_user_audio_preroll(self):
         """Re-append the buffered pre-roll audio to the input buffer.

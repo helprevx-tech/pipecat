@@ -8,6 +8,8 @@ import asyncio
 import unittest
 from typing import TypedDict
 
+import pytest
+
 from pipecat.flows.exceptions import InvalidFunctionError
 from pipecat.flows.manager import FlowManager
 from pipecat.flows.types import (
@@ -360,7 +362,7 @@ class TestFlowsDirectFunctionDeprecatedAlias(unittest.TestCase):
     """@flows_direct_function is a deprecated alias of @flows_tool_options."""
 
     def test_alias_warns_but_still_attaches_options(self):
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
 
             @flows_direct_function(cancel_on_interruption=True, timeout_secs=42)
             async def my_function(flow_manager: FlowManager):

@@ -166,9 +166,22 @@ if __name__ == "__main__":
 
 
 @pytest.mark.parametrize("voice", [None, ""], ids=["none", "blank"])
-def test_local_piper_rejects_a_missing_or_blank_voice_before_downloading(voice):
+def test_local_piper_rejects_a_missing_or_blank_voice_before_downloading(
+    voice, tmp_path, monkeypatch
+):
+    """Invalid settings create no cache and never reach model download/loading."""
     pytest.importorskip("piper")
+    from unittest.mock import Mock
+
     from pipecat.services.piper.tts import PiperTTSService
 
+    download = Mock(side_effect=AssertionError("Invalid voice attempted a download"))
+    load = Mock(side_effect=AssertionError("Invalid voice attempted model loading"))
+    monkeypatch.setattr("pipecat.services.piper.tts.download_voice", download)
+    monkeypatch.setattr("pipecat.services.piper.tts.PiperVoice.load", load)
+    cache = tmp_path / "must-not-be-created"
     with pytest.raises(ValueError, match="Piper TTS voice must be specified"):
-        PiperTTSService(settings=PiperTTSService.Settings(voice=voice))
+        PiperTTSService(settings=PiperTTSService.Settings(voice=voice), download_dir=cache)
+    assert not cache.exists()
+    download.assert_not_called()
+    load.assert_not_called()

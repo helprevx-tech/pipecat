@@ -19,6 +19,8 @@ class AayiqAgentLLMService(OpenAILLMService):
     admission and cost attribution. The client never resubmits partial output.
     """
 
+    _requires_api_key = True
+
     supports_developer_role = False
 
     def __init__(

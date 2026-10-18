@@ -4,8 +4,16 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-import locale
+"""Voice text transformations, including deterministic locale-independent dates.
+
+The date regression uses the actual formatter/calendar with a hostile strftime
+boundary; it needs no host locale installation or process-global LC_TIME change.
+Other transformation inputs/assertions remain unchanged. No provider is used.
+"""
+
 import unittest
+from datetime import datetime
+from unittest.mock import patch
 
 from pipecat.utils.text.alnum_utils import alnum_only
 from pipecat.utils.text.transforms.acronyms import normalize_acronyms
@@ -466,19 +474,67 @@ class TestNormalizeDates(unittest.IsolatedAsyncioTestCase):
         self.assertIn("3rd", await normalize_dates("2023-05-03", "*"))
 
     async def test_month_is_english_under_non_english_locale(self):
-        # The month must stay English even when LC_TIME is a non-English locale,
-        # to match the hardcoded-English year and ordinal suffix.
-        saved = locale.setlocale(locale.LC_TIME)
-        try:
-            locale.setlocale(locale.LC_TIME, "de_DE.UTF-8")
-        except locale.Error:
-            self.skipTest("de_DE.UTF-8 locale not available")
-        try:
-            result = await normalize_dates("Meeting on 2023-05-10", "*")
-        finally:
-            locale.setlocale(locale.LC_TIME, saved)
-        self.assertIn("May 10th", result)
-        self.assertNotIn("Mai", result)
+        """A hostile locale-sensitive formatter cannot change English month output.
+
+        This deterministic dependency-boundary test does not claim that the host
+        has de_DE installed. The real datetime constructor/date validation and
+        normalize_dates/ordinal/year conversion still run. A regression to %B
+        invokes the poisoned formatter and fails the original English assertion.
+        No process-global LC_TIME is read or changed, so concurrent tests remain
+        independent of host locale availability.
+        """
+        english = (
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
+        )
+        german = (
+            "Januar",
+            "Februar",
+            "März",
+            "April",
+            "Mai",
+            "Juni",
+            "Juli",
+            "August",
+            "September",
+            "Oktober",
+            "November",
+            "Dezember",
+        )
+        formatting_calls = []
+
+        class HostileLocaleDateTime(datetime):
+            """Keep native calendar parsing, poisoning only locale month formatting."""
+
+            def strftime(self, format):
+                """Make a %B regression observably non-English without global locale."""
+                formatting_calls.append(format)
+                if format == "%B":
+                    return german[self.month - 1]
+                return super().strftime(format)
+
+        self.assertEqual(HostileLocaleDateTime(2023, 5, 10).strftime("%B"), "Mai")
+        formatting_calls.clear()
+        with patch("pipecat.utils.text.transforms.dates.datetime", HostileLocaleDateTime):
+            for month, name in enumerate(english, start=1):
+                for text in (f"Meeting on 2023-{month:02d}-10", f"Meeting on {month:02d}/10/2023"):
+                    result = await normalize_dates(text, "*")
+                    self.assertIn(f"{name} 10th", result)
+                    if month == 5:
+                        self.assertNotIn("Mai", result)
+            for text in ("Invalid 2023-02-30", "Invalid 13/45/2023"):
+                self.assertEqual(await normalize_dates(text, "*"), text)
+        self.assertEqual(formatting_calls, [])
 
 
 class TestExpandNumbers(unittest.IsolatedAsyncioTestCase):

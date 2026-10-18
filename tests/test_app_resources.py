@@ -10,6 +10,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
+import pytest
+
 from pipecat.adapters.schemas.direct_function import DirectFunctionWrapper
 from pipecat.clocks.system_clock import SystemClock
 from pipecat.frames.frames import EndFrame, Frame, StartFrame
@@ -96,7 +98,7 @@ class TestFunctionCallParamsAppResources(unittest.TestCase):
             result_callback=AsyncMock(),
             app_resources=resources,
         )
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             value = params.tool_resources
         self.assertIs(value, resources)
 
@@ -218,7 +220,7 @@ class TestLLMServiceFunctionCallReadsAppResources(unittest.IsolatedAsyncioTestCa
             tool_resources=resources,
         )
 
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             value = setup.tool_resources
         self.assertIs(value, resources)
 
@@ -235,14 +237,14 @@ class TestPipelineWorkerAppResources(unittest.TestCase):
 
     def test_tool_resources_kwarg_warns_and_aliases_app_resources(self):
         resources = _Resources(user_name="John")
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             worker = PipelineWorker(Pipeline([]), tool_resources=resources)
         self.assertIs(worker.app_resources, resources)
 
     def test_app_resources_takes_precedence_over_tool_resources(self):
         new = _Resources(user_name="new")
         old = _Resources(user_name="old")
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             worker = PipelineWorker(Pipeline([]), app_resources=new, tool_resources=old)
         self.assertIs(worker.app_resources, new)
 
@@ -297,7 +299,7 @@ class TestFrameProcessorSetupToolResourcesBackwardsCompat(unittest.IsolatedAsync
         worker = PipelineWorker(pipeline, app_resources=resources)
 
         await worker.queue_frame(EndFrame())
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             await worker.run(WorkerParams(task_manager=TaskManager()))
 
         self.assertIs(legacy.captured_tool_resources, resources)
@@ -311,11 +313,11 @@ class TestFrameProcessorSetupToolResourcesBackwardsCompat(unittest.IsolatedAsync
         resources = _Resources(user_name="John")
         legacy = _LegacyToolResourcesReader()
         pipeline = Pipeline([legacy])
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             worker = PipelineWorker(pipeline, tool_resources=resources)
 
         await worker.queue_frame(EndFrame())
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             await worker.run(WorkerParams(task_manager=TaskManager()))
 
         self.assertIs(legacy.captured_tool_resources, resources)

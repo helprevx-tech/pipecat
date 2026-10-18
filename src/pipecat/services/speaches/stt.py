@@ -24,6 +24,8 @@ class SpeachesSTTService(OpenAISTTService):
     instead of a custom websocket protocol.
     """
 
+    _requires_api_key = True
+
     Settings = SpeachesSTTSettings
 
     def __init__(

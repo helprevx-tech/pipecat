@@ -12,6 +12,8 @@ import unittest
 import warnings
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from pipecat.adapters.schemas.direct_function import DirectFunctionWrapper
 from pipecat.bus.messages import BusJobCancelMessage, BusJobRequestMessage, BusTTSSpeakMessage
 from pipecat.bus.ui.messages import (
@@ -708,7 +710,7 @@ class TestUIWorkerRespondToJob(unittest.IsolatedAsyncioTestCase):
         message = BusJobRequestMessage(source="voice", target="ui", job_name="respond", job_id="t1")
         t = await _start(worker, message)
 
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             await worker.respond_to_job("spoken phrase", tts_speak=True)
         await t
 

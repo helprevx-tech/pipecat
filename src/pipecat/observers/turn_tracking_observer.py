@@ -55,6 +55,8 @@ class TurnTrackingObserver(BaseObserver):
     Events:
 
     - on_turn_started: Triggered when a turn starts, providing the turn number
+    - on_pipeline_ended: Reports the current turn for final audio flush without
+      ending its tracing context or inventing a completed conversation turn.
     - on_turn_ended: Triggered when a turn ends, providing the turn number, the turn's
       duration in seconds, and whether it was interrupted
     """
@@ -101,6 +103,7 @@ class TurnTrackingObserver(BaseObserver):
         # them preserves the exact frame order without blocking the pipeline.
         self._register_event_handler("on_turn_started", sync=True)
         self._register_event_handler("on_turn_ended", sync=True)
+        self._register_event_handler("on_pipeline_ended", sync=True)
         self._register_event_handler("on_user_speech_started_for_turn", sync=True)
         self._register_event_handler("on_user_speech_stopped_for_turn", sync=True)
         self._register_event_handler("on_bot_started_speaking", sync=True)
@@ -259,8 +262,16 @@ class TurnTrackingObserver(BaseObserver):
             self._schedule_turn_end(data)
 
     async def _handle_pipeline_end(self, data: FramePushed):
-        """Cancel the timer; tracing closes the turn after downstream processors drain."""
+        """Flush terminal recording while preserving the active turn until tracing drains.
+
+        The synchronous event uses this observer's ordered turn number. It does
+        not fire on_turn_ended, advance a turn, or clear the current span context.
+        Audio subscribers clear their own buffers, so repeated terminal frames
+        cannot duplicate the last recording.
+        """
         self._cancel_turn_end_timer()
+        if self._turn_count:
+            await self._call_event_handler("on_pipeline_ended", self._turn_count)
 
     async def _start_turn(self, data: FramePushed):
         """Start a new turn."""

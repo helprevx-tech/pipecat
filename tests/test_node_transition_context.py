@@ -8,7 +8,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from pipecat.frames.frames import NodeTransitionStartedFrame, TranscriptionFrame
+from pipecat.frames.frames import (
+    LLMContextUserTurnFrame,
+    NodeTransitionStartedFrame,
+    TranscriptionFrame,
+)
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregator
 from pipecat.utils.asyncio.task_manager import TaskManager
@@ -49,7 +53,13 @@ async def test_transition_cancels_deferred_flush_before_acknowledging(pending_te
         assert context.messages == (
             [{"role": "user", "content": pending_text}] if pending_text else []
         )
-        aggregator.push_frame.assert_not_awaited()
+        # Upstream emits one user-turn notification in each direction; neither
+        # is an inference request and a duplicate transition emits no more.
+        notifications = aggregator.push_frame.await_args_list
+        assert [type(call.args[0]) for call in notifications] == (
+            [LLMContextUserTurnFrame] * 2 if pending_text else []
+        )
+        assert all(call.args[0].text == pending_text for call in notifications)
     finally:
         await aggregator.cleanup()
 

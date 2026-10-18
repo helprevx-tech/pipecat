@@ -177,7 +177,8 @@ class AnthropicLLMSettings(LLMSettings):
         thinking: Thinking configuration. If neither this nor ``effort`` is
             set, Pipecat sends the lowest thinking setting Anthropic documents
             for the model, for the fastest responses, and logs what it sent.
-            Models Pipecat doesn't list run at Anthropic's default.
+            Models Pipecat doesn't list, and any model when
+            ``use_provider_thinking_default`` is set, run at Anthropic's default.
         effort: How much the model spends on its response, thinking included:
             "low", "medium", "high", "xhigh" or "max". Sent as
             ``output_config.effort``. ``None`` uses the model's default. Lower
@@ -425,9 +426,10 @@ class AnthropicLLMService(LLMService[AnthropicLLMAdapter]):
         Applies the model's entry in ``_THINKING_DEFAULTS``, if it has one. A
         request that already sets ``thinking`` or an effort, from the settings
         or from ``extra``, is left as it is, since the two together decide how
-        much the model thinks. The first request for each model logs the
-        setting sent or, for a Claude model that isn't listed, warns that it
-        runs at Anthropic's default.
+        much the model thinks. So is every request when
+        ``use_provider_thinking_default`` is set. The first request for each model
+        logs the setting sent, or that the model runs at Anthropic's default,
+        warning for an unlisted Claude model.
 
         Args:
             params: The request params dict (modified in place).
@@ -526,6 +528,7 @@ class AnthropicLLMService(LLMService[AnthropicLLMAdapter]):
 
         # LLM completion
         response = await self._client.beta.messages.create(**params)
+        self._handle_stop_reason(response)
 
         return next((block.text for block in response.content if hasattr(block, "text")), None)
 
@@ -680,6 +683,9 @@ class AnthropicLLMService(LLMService[AnthropicLLMAdapter]):
                             )
                         )
 
+                if event.type == "message_delta":
+                    self._handle_stop_reason(event.delta)
+
                 # Usage counts are cumulative: message_start reports them so far
                 # and message_delta for the whole message, so each replaces the
                 # last. A field a message_delta leaves out keeps its earlier value.
@@ -776,6 +782,26 @@ class AnthropicLLMService(LLMService[AnthropicLLMAdapter]):
             self._settings.enable_prompt_caching = frame.enable
         else:
             await self.push_frame(frame, direction)
+
+    def _handle_stop_reason(self, result):
+        """Log why Claude stopped generating, when it stopped for a notable reason.
+
+        Anything other than a normal stop leaves the turn short of what the model
+        would otherwise have said: the request was refused, or the output hit the
+        token limit or the context window. Whatever text did arrive is still
+        passed on.
+
+        Args:
+            result: A streamed ``message_delta``'s delta or a complete message;
+                both carry ``stop_reason`` and ``stop_details``.
+        """
+        stop_reason = getattr(result, "stop_reason", None)
+        if stop_reason in (None, "end_turn", "tool_use", "stop_sequence"):
+            return
+
+        category = getattr(getattr(result, "stop_details", None), "category", None)
+        detail = f" ({category})" if category else ""
+        logger.warning(f"{self}: response incomplete, the model stopped for {stop_reason}{detail}")
 
     def _estimate_tokens(self, text: str) -> int:
         return int(len(re.split(r"[^\w]+", text)) * 1.3)

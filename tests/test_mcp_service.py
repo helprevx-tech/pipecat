@@ -835,7 +835,7 @@ class TestDeprecatedRegistrationApi(MCPClientTestBase):
     async def test_get_tools_schema_warns_and_returns_handlerless_schemas(self):
         client, server = self._make_client([_tool("tool_a")])
         await client.start()
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             tools_schema = await client.get_tools_schema()
         self.assertEqual({s.name for s in tools_schema.standard_tools}, {"tool_a"})
         for schema in tools_schema.standard_tools:
@@ -846,7 +846,7 @@ class TestDeprecatedRegistrationApi(MCPClientTestBase):
         client, server = self._make_client([_tool("tool_a"), _tool("tool_b")])
         await client.start()
         llm = MagicMock()
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             tools_schema = await client.register_tools(llm)
         self.assertEqual(llm.register_function.call_count, 2)
         registered = {call.args[0] for call in llm.register_function.call_args_list}
@@ -860,7 +860,7 @@ class TestDeprecatedRegistrationApi(MCPClientTestBase):
         await client.start()
         tools_schema = await client.tools()
         llm = MagicMock()
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             await client.register_tools_schema(tools_schema, llm)
         llm.register_function.assert_called_once()
         await client.close()
@@ -911,7 +911,7 @@ class TestAutoCloseOnCleanup(MCPClientTestBase):
         client, server = self._make_client([_tool("tool_a")])
         await client.start()
         service = LLMService()
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             await client.register_tools(service)
         await service.cleanup()
         self.assertEqual(server.exits, 1)
@@ -944,7 +944,7 @@ class TestLLMAutoRegistration(MCPClientTestBase):
         client, server = self._make_client([_tool("tool_a")])
         await client.start()
         service = LLMService()
-        with self.assertWarns(DeprecationWarning):
+        with pytest.warns(DeprecationWarning):
             tools_schema = await client.register_tools(service)
         # Advertising the handler-less schemas alongside the manual registration
         # must not trip the redundant-manual-registration advisory.
