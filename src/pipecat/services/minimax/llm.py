@@ -15,7 +15,8 @@ forwarded to TTS as if it were the model's answer.
 This service extends :class:`OpenAILLMService` to detect a leading
 ``<think>`` block in the stream and strip it before the base OpenAI loop
 sees it. Reasoning content is re-emitted as ``LLMThought*Frame`` objects so
-observers and logging can still see it.
+observers and logging can still see it. None/empty endpoint keys are refused
+before SDK construction instead of inheriting OPENAI_API_KEY.
 """
 
 import inspect
@@ -98,7 +99,16 @@ class MiniMaxLLMService(OpenAILLMService):
             settings: Runtime-updatable settings. When provided alongside
                 deprecated parameters, ``settings`` values take precedence.
             **kwargs: Additional keyword arguments passed to OpenAILLMService.
+
+        Raises:
+            ValueError: A None/empty explicit key is rejected before native SDK
+                construction; this hosted provider never inherits OPENAI_API_KEY.
         """
+        # Never let this alternate endpoint inherit OPENAI_API_KEY through
+        # the SDK. Other values keep the existing native validation contract.
+        if api_key is None or api_key == "":
+            raise ValueError("MiniMaxLLMService requires an explicit non-empty api_key.")
+
         default_settings = self.Settings(model="MiniMax-M2.7")
 
         if model is not None:

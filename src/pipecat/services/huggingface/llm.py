@@ -7,7 +7,8 @@
 """Hugging Face LLM service implementation.
 
 Uses Hugging Face's OpenAI-compatible Inference Providers chat-completions
-endpoint for hosted, usage-based model inference.
+endpoint for hosted, usage-based model inference. None/empty keys are rejected
+before SDK construction so another provider's environment key cannot be inherited.
 """
 
 from collections.abc import Mapping
@@ -55,7 +56,16 @@ class HuggingFaceLLMService(OpenAILLMService):
 
             settings: Runtime-updatable settings.
             **kwargs: Additional keyword arguments passed to OpenAILLMService.
+
+        Raises:
+            ValueError: A None/empty explicit key is rejected before native SDK
+                construction; this hosted provider never inherits OPENAI_API_KEY.
         """
+        # Never let this alternate endpoint inherit OPENAI_API_KEY through
+        # the SDK. Other values keep the existing native validation contract.
+        if api_key is None or api_key == "":
+            raise ValueError("HuggingFaceLLMService requires an explicit non-empty api_key.")
+
         default_settings = self.Settings(model="openai/gpt-oss-120b:cerebras")
 
         if model is not None:
