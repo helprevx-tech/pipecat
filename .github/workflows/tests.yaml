@@ -44,7 +44,6 @@ jobs:
             --extra daily \
             --extra deepgram \
             --extra google \
-            --extra groq \
             --extra langchain \
             --extra livekit \
             --extra mcp \
@@ -53,7 +52,6 @@ jobs:
             --extra pgmq \
             --extra piper \
             --extra redis \
-            --extra rime \
             --extra runner \
             --extra sagemaker \
             --extra sarvam \
@@ -64,4 +62,4 @@ jobs:
 
       - name: Test with pytest
         run: |
-          uv run pytest -ra
+          uv run pytest

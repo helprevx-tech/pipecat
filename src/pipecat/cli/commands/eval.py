@@ -639,7 +639,9 @@ async def _judge_all(
     concurrency: int,
     verbose: bool,
 ) -> list[EvalSimulationResult]:
-    """Judge every conversation, ``concurrency`` at a time, writing each line as it is judged."""
+    """Judge conversations with a positive limit; invalid limits raise before opening output."""
+    if type(concurrency) is not int or concurrency < 1:
+        raise ValueError("concurrency must be a positive integer")
     semaphore = asyncio.Semaphore(concurrency)
     results: list[EvalSimulationResult] = []
     with output.open("w") as f:
@@ -675,7 +677,7 @@ def judge(
         Path("judged.jsonl"), "-o", "--output", help="JSONL file to write, one line per file."
     ),
     concurrency: int = typer.Option(
-        4, "-c", "--concurrency", help="How many conversations to judge at once."
+        4, "-c", "--concurrency", min=1, help="How many conversations to judge at once."
     ),
     verbose: bool = typer.Option(
         False, "-v", "--verbose", help="Print the judge's reason and each metric's score."
