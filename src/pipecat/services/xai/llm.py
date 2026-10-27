@@ -10,14 +10,14 @@ This module provides a service for interacting with Grok's API through an
 OpenAI-compatible interface.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
 from loguru import logger
 from openai.types import CompletionUsage
 
 from pipecat.adapters.services.open_ai_adapter import OpenAILLMInvocationParams
-from pipecat.metrics.metrics import LLMTokenUsage
+from pipecat.metrics.metrics import LLMInferenceUsage, LLMTokenUsage
 from pipecat.services.openai.base_llm import BaseOpenAILLMService
 from pipecat.services.openai.llm import (
     OpenAILLMService,
@@ -132,6 +132,18 @@ class GrokLLMService(OpenAILLMService):
             params.setdefault("reasoning_effort", reasoning_effort)
 
         return params
+
+    def _inference_usage(self, response: Any) -> LLMInferenceUsage | None:
+        """Do not guess reasoning inclusion when a partial response lacks its proving total/input."""
+        usage = super()._inference_usage(response)
+        if (
+            usage is not None
+            and usage.reasoning_tokens is not None
+            and usage.reasoning_tokens > 0
+            and (usage.prompt_tokens is None or usage.total_tokens is None)
+        ):
+            return replace(usage, completion_tokens=None)
+        return usage
 
     def _token_usage(self, usage: CompletionUsage) -> LLMTokenUsage:
         """Convert a Grok chat completion's usage into Pipecat's token usage.

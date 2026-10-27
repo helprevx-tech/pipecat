@@ -54,7 +54,7 @@ from pipecat.frames.frames import (
     LLMThoughtStartFrame,
     LLMThoughtTextFrame,
 )
-from pipecat.metrics.metrics import LLMTokenUsage
+from pipecat.metrics.metrics import LLMInferenceUsage, LLMTokenUsage
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.llm_service import (
@@ -269,6 +269,7 @@ class _BaseOpenAIResponsesLLMService(LLMService[OpenAIResponsesLLMAdapter]):
     adapter_class = OpenAIResponsesLLMAdapter
 
     supports_response_schema: bool = True
+    supports_inference_usage: bool = True
 
     def __init__(
         self,
@@ -513,8 +514,26 @@ class _BaseOpenAIResponsesLLMService(LLMService[OpenAIResponsesLLMAdapter]):
             }
 
         response = await self._client.responses.create(**params)
+        await self._observe_inference_usage(response)
 
         return response.output_text
+
+    def _inference_usage(self, response: Any) -> LLMInferenceUsage | None:
+        """Copy independent response counters without the pipeline metrics' missing-to-zero policy."""
+        field = self._inference_usage_field
+        usage = field(response, "usage")
+        if usage is None:
+            return None
+        prompt_details = field(usage, "input_tokens_details")
+        completion_details = field(usage, "output_tokens_details")
+        return LLMInferenceUsage(
+            prompt_tokens=field(usage, "input_tokens"),
+            completion_tokens=field(usage, "output_tokens"),
+            total_tokens=field(usage, "total_tokens"),
+            cache_read_input_tokens=field(prompt_details, "cached_tokens"),
+            cache_creation_input_tokens=field(prompt_details, "cache_write_tokens"),
+            reasoning_tokens=field(completion_details, "reasoning_tokens"),
+        )
 
     def _process_function_calls(
         self,

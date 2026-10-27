@@ -36,7 +36,7 @@ from pipecat.frames.frames import (
     LLMThoughtStartFrame,
     LLMThoughtTextFrame,
 )
-from pipecat.metrics.metrics import LLMTokenUsage
+from pipecat.metrics.metrics import LLMInferenceUsage, LLMTokenUsage
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.llm_service import FunctionCallFromLLM, LLMService
@@ -233,6 +233,7 @@ class AnthropicLLMService(LLMService[AnthropicLLMAdapter]):
     adapter_class = AnthropicLLMAdapter
 
     supports_response_schema: bool = True
+    supports_inference_usage: bool = True
 
     # Backward compatibility: ThinkingConfig used to be defined inline here.
     ThinkingConfig = AnthropicThinkingConfig
@@ -528,9 +529,30 @@ class AnthropicLLMService(LLMService[AnthropicLLMAdapter]):
 
         # LLM completion
         response = await self._client.beta.messages.create(**params)
+        await self._observe_inference_usage(response)
         self._handle_stop_reason(response)
 
         return next((block.text for block in response.content if hasattr(block, "text")), None)
+
+    def _inference_usage(self, response: Any) -> LLMInferenceUsage | None:
+        """Retain net input and known cache counts without inventing a gross total."""
+        field = self._inference_usage_field
+        usage = field(response, "usage")
+        if usage is None:
+            return None
+        prompt, completion = field(usage, "input_tokens"), field(usage, "output_tokens")
+        cached, created = (
+            field(usage, "cache_read_input_tokens"),
+            field(usage, "cache_creation_input_tokens"),
+        )
+        return LLMInferenceUsage(
+            prompt_tokens=prompt,
+            completion_tokens=completion,
+            total_tokens=LLMInferenceUsage.sum_tokens(prompt, completion, cached, created),
+            cache_read_input_tokens=cached,
+            cache_creation_input_tokens=created,
+            reasoning_tokens=field(field(usage, "output_tokens_details"), "thinking_tokens"),
+        )
 
     # Models known to support assistant message prefilling (a request whose
     # message list ends with an assistant message). Anthropic dropped prefill

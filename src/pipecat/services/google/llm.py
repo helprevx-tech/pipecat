@@ -39,7 +39,7 @@ from pipecat.frames.frames import (
     LLMThoughtStartFrame,
     LLMThoughtTextFrame,
 )
-from pipecat.metrics.metrics import LLMTokenUsage
+from pipecat.metrics.metrics import LLMInferenceUsage, LLMTokenUsage
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.google.frames import LLMSearchResponseFrame
@@ -219,6 +219,7 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
     adapter_class = GeminiLLMAdapter
 
     supports_response_schema: bool = True
+    supports_inference_usage: bool = True
 
     # Backward compatibility: ThinkingConfig used to be defined inline here.
     ThinkingConfig = GoogleThinkingConfig
@@ -467,6 +468,7 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
             contents=cast(Any, messages),
             config=generation_config,
         )
+        await self._observe_inference_usage(response)
 
         if response.candidates and response.candidates[0].finish_reason:
             self._handle_finish_reason(response.candidates[0].finish_reason)
@@ -750,6 +752,28 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
             aclose = getattr(response, "aclose", None)
             if aclose is not None:
                 await aclose()
+
+    def _inference_usage(self, response: Any) -> LLMInferenceUsage | None:
+        """Preserve reported totals while unknown tool/thought addends keep derived counts unknown."""
+        field = self._inference_usage_field
+        usage = field(response, "usage_metadata")
+        if usage is None:
+            return None
+        reasoning = field(usage, "thoughts_token_count")
+        prompt = LLMInferenceUsage.sum_tokens(
+            field(usage, "prompt_token_count"), field(usage, "tool_use_prompt_token_count")
+        )
+        completion = LLMInferenceUsage.sum_tokens(field(usage, "candidates_token_count"), reasoning)
+        total = field(usage, "total_token_count")
+        return LLMInferenceUsage(
+            prompt_tokens=prompt,
+            completion_tokens=completion,
+            total_tokens=total
+            if total is not None
+            else LLMInferenceUsage.sum_tokens(prompt, completion),
+            cache_read_input_tokens=field(usage, "cached_content_token_count"),
+            reasoning_tokens=reasoning,
+        )
 
     def _handle_finish_reason(self, finish_reason: FinishReason):
         """Log why Gemini stopped generating, when it stopped for a notable reason.

@@ -9,7 +9,8 @@
 Services that require user-context aggregation must receive its acknowledgement
 before announcing or preparing a transition batch. Failed or cancelled waits do
 not transfer tool ownership; normal generation, interruption and dispatch fences
-remain responsible for accepted calls.
+remain responsible for accepted calls. Optional one-shot usage is observed inline
+without changing inference results or enabling pipeline accounting.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ import asyncio
 import json
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -64,6 +65,7 @@ from pipecat.frames.frames import (
     StartFrame,
     StopFrame,
 )
+from pipecat.metrics.metrics import LLMInferenceUsage
 from pipecat.processors.aggregators.async_tool_messages import ASYNC_TOOL_INSTRUCTIONS
 from pipecat.processors.aggregators.llm_context import (
     NOT_GIVEN,
@@ -338,6 +340,14 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
     models can, they also override :meth:`model_supports_response_schema`.
     """
 
+    supports_inference_usage: bool = False
+    """Whether one-shot responses can emit optional inline usage observations.
+
+    Register a fast ``on_inference_usage(service, usage)`` handler to receive a
+    frozen LLMInferenceUsage or None when a response has no usable counters.
+    This does not enable pipeline metrics or guarantee provider measurement.
+    """
+
     def __init__(
         self,
         run_in_parallel: bool = True,
@@ -478,6 +488,7 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
         self._register_event_handler("on_function_calls_prepared", sync=True)
         self._register_event_handler("on_function_calls_cancelled")
         self._register_event_handler("on_completion_timeout")
+        self._register_event_handler("on_inference_usage", sync=True)
 
     @classmethod
     def _resolve_adapter_class(cls) -> type[BaseLLMAdapter]:
@@ -579,6 +590,43 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
             The LLM's response as a string, or None if no response is generated.
         """
         raise NotImplementedError(f"run_inference() not supported by {self.__class__.__name__}")
+
+    @staticmethod
+    def _inference_usage_field(value: Any, name: str) -> Any:
+        """Read an optional SDK/mapping field without treating malformed containers as absent."""
+        if value is None:
+            return None
+        if isinstance(value, Mapping):
+            return value.get(name)
+        if isinstance(
+            value, (str, bytes, bytearray, int, float, complex, list, tuple, set, frozenset)
+        ):
+            raise ValueError("Invalid one-shot usage metadata")
+        return getattr(value, name, None)
+
+    def _inference_usage(self, response: Any) -> LLMInferenceUsage | None:
+        """Convert one completed SDK response; unsupported services have no usage observation."""
+        return None
+
+    async def _observe_inference_usage(self, response: Any):
+        """Deliver optional counters inline before text extraction, without another request.
+
+        Unobserved services do not inspect usage. Malformed provider metadata
+        becomes None without changing inference output. Existing event handling
+        isolates ordinary observer errors; cancellation still propagates.
+        """
+        event = self._event_handlers.get("on_inference_usage")
+        if event is None or not event.handlers:
+            return
+        try:
+            usage = self._inference_usage(response)
+            if not isinstance(usage, LLMInferenceUsage) or not any(
+                getattr(usage, item.name) is not None for item in fields(usage)
+            ):
+                usage = None
+        except Exception:
+            usage = None
+        await self._call_event_handler("on_inference_usage", usage)
 
     def _check_response_schema(
         self, response_schema: dict[str, Any] | None

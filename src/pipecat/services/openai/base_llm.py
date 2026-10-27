@@ -12,6 +12,7 @@ import re
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 from loguru import logger
@@ -43,7 +44,7 @@ from pipecat.frames.frames import (
     LLMFullResponseStartFrame,
     LLMTextFrame,
 )
-from pipecat.metrics.metrics import LLMTokenUsage
+from pipecat.metrics.metrics import LLMInferenceUsage, LLMTokenUsage
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.llm_service import FunctionCallFromLLM, LLMService
@@ -117,6 +118,8 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
     supports_response_schema: bool = True
     """Whether the API can enforce a response schema. OpenAI-compatible
     services whose API cannot should set this to ``False``."""
+
+    supports_inference_usage: bool = True
 
     @deprecated(
         "`BaseOpenAILLMService.InputParams` is deprecated since 0.0.105 and will be removed in "
@@ -503,8 +506,49 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
 
         # LLM completion
         response = await self._client.chat.completions.create(**params)
+        await self._observe_inference_usage(response)
 
         return response.choices[0].message.content
+
+    def _inference_usage(self, response: Any) -> LLMInferenceUsage | None:
+        """Preserve optional one-shot counters and existing complete-usage provider overrides."""
+        field = self._inference_usage_field
+        usage = field(response, "usage")
+        if usage is None:
+            return None
+        prompt_details = field(usage, "prompt_tokens_details")
+        completion_details = field(usage, "completion_tokens_details")
+        observed = LLMInferenceUsage(
+            prompt_tokens=field(usage, "prompt_tokens"),
+            completion_tokens=field(usage, "completion_tokens"),
+            total_tokens=field(usage, "total_tokens"),
+            cache_read_input_tokens=field(prompt_details, "cached_tokens"),
+            cache_creation_input_tokens=field(prompt_details, "cache_write_tokens"),
+            reasoning_tokens=field(completion_details, "reasoning_tokens"),
+        )
+        if all(
+            value is not None
+            for value in (observed.prompt_tokens, observed.completion_tokens, observed.total_tokens)
+        ):
+            # Lenient SDK decoders may omit optional detail attributes. Supply
+            # only validated counters to the existing provider normalizer.
+            complete: Any = SimpleNamespace(
+                prompt_tokens=observed.prompt_tokens,
+                completion_tokens=observed.completion_tokens,
+                total_tokens=observed.total_tokens,
+                prompt_tokens_details=SimpleNamespace(
+                    cached_tokens=observed.cache_read_input_tokens,
+                    cache_write_tokens=observed.cache_creation_input_tokens,
+                ),
+                completion_tokens_details=SimpleNamespace(
+                    reasoning_tokens=observed.reasoning_tokens
+                ),
+            )
+            normalized = self._token_usage(complete)
+            return LLMInferenceUsage(
+                **{name: getattr(normalized, name) for name in observed.__dataclass_fields__}
+            )
+        return observed
 
     def _token_usage(self, usage: CompletionUsage) -> LLMTokenUsage:
         """Convert a chat completion's usage into Pipecat's token usage.

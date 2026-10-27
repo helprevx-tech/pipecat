@@ -33,7 +33,7 @@ from pipecat.frames.frames import (
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
 )
-from pipecat.metrics.metrics import LLMTokenUsage
+from pipecat.metrics.metrics import LLMInferenceUsage, LLMTokenUsage
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.aws.utils import resolve_credentials
@@ -93,6 +93,7 @@ class AWSBedrockLLMService(LLMService[AWSBedrockLLMAdapter]):
     """
 
     Settings = AWSBedrockLLMSettings
+    supports_inference_usage: bool = True
     _settings: Settings
 
     # Overriding the default adapter to use the Anthropic one.
@@ -347,6 +348,7 @@ class AWSBedrockLLMService(LLMService[AWSBedrockLLMAdapter]):
         ) as client:
             # Call Bedrock without streaming
             response = await client.converse(**request_params)
+            await self._observe_inference_usage(response)
 
             # Extract the response text
             if (
@@ -363,6 +365,28 @@ class AWSBedrockLLMService(LLMService[AWSBedrockLLMAdapter]):
                     return content
 
             return None
+
+    def _inference_usage(self, response: Any) -> LLMInferenceUsage | None:
+        """Use actual one-shot total when present; otherwise sum only known net/cache components."""
+        field = self._inference_usage_field
+        usage = field(response, "usage")
+        if usage is None:
+            return None
+        prompt, completion = field(usage, "inputTokens"), field(usage, "outputTokens")
+        cached, created = (
+            field(usage, "cacheReadInputTokens"),
+            field(usage, "cacheWriteInputTokens"),
+        )
+        total = field(usage, "totalTokens")
+        return LLMInferenceUsage(
+            prompt_tokens=prompt,
+            completion_tokens=completion,
+            total_tokens=total
+            if total is not None
+            else LLMInferenceUsage.sum_tokens(prompt, completion, cached, created),
+            cache_read_input_tokens=cached,
+            cache_creation_input_tokens=created,
+        )
 
     async def _create_converse_stream(self, client, request_params):
         """Create converse stream with optional timeout and retry.

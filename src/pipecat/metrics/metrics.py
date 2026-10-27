@@ -4,12 +4,14 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-"""Metrics data models for Pipecat framework.
+"""Metrics and one-shot usage observation models for Pipecat framework.
 
 This module defines Pydantic models for various types of metrics data
 collected throughout the pipeline, including timing, token usage, and
 processing statistics.
 """
+
+from dataclasses import dataclass, fields
 
 from pydantic import BaseModel
 
@@ -104,6 +106,53 @@ class ProcessingMetricsData(MetricsData):
     """
 
     value: float
+
+
+@dataclass(frozen=True, slots=True)
+class LLMInferenceUsage:
+    """Optional provider counters received by an out-of-pipeline inference.
+
+    Missing counters remain None; explicit zero is a measurement. Prompt counts
+    retain provider net/gross cache semantics, as with LLMTokenUsage. Totals may
+    be independently reported rather than the sum of the visible components.
+    Counters use the cross-language safe integer range and contain no request,
+    response, timestamp or financial data.
+
+    Parameters:
+        prompt_tokens: Known prompt count, including tool input when known.
+        completion_tokens: Known completion count, including reasoning when known.
+        total_tokens: Reported total or a sum of completely known components.
+        cache_read_input_tokens: Known cache-read input count.
+        cache_creation_input_tokens: Known cache-write input count.
+        reasoning_tokens: Known reasoning portion of generated output.
+    """
+
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
+    reasoning_tokens: int | None = None
+
+    def __post_init__(self):
+        """Reject malformed reported counters without coercing booleans or strings."""
+        if any(not self._valid_count(getattr(self, item.name)) for item in fields(self)):
+            raise ValueError("Invalid one-shot token count")
+
+    @staticmethod
+    def _valid_count(value: object) -> bool:
+        """Accept unknown or exact nonnegative integers representable by JS clients."""
+        return value is None or type(value) is int and 0 <= value <= 9007199254740991
+
+    @staticmethod
+    def sum_tokens(*values: int | None) -> int | None:
+        """Sum only completely known valid addends; derived overflow stays unknown."""
+        if any(not LLMInferenceUsage._valid_count(value) for value in values):
+            raise ValueError("Invalid one-shot token count")
+        if not values or any(value is None for value in values):
+            return None
+        total = sum(value for value in values if value is not None)
+        return total if LLMInferenceUsage._valid_count(total) else None
 
 
 class LLMTokenUsage(BaseModel):
