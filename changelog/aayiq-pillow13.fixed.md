@@ -1,0 +1,1 @@
+- Require Pillow 13 for its native image security fixes. LemonSlice accepts mode-I avatar images only when all pixels fit unsigned 16-bit PNG, preserving their values and leaving the caller-owned image open; invalid ranges are rejected before upload.

@@ -8,6 +8,10 @@
 
 This module provides helper classes for interacting with the LemonSlice API,
 including session creation and termination.
+
+PNG upload encoding preserves caller-owned images. Mode-I images are accepted
+only when their complete pixel range fits unsigned 16-bit PNG without clipping;
+invalid range/empty inputs fail before a session HTTP request.
 """
 
 import io
@@ -57,7 +61,8 @@ class LemonSliceApi:
         Args:
             agent_image_url: URL to an agent image.
             agent_id: ID of a LemonSlice agent.
-            agent_image: PIL image of the agent.
+            agent_image: PNG-compatible PIL image of the agent. Mode-I pixels must
+                all fit 0..65535 for lossless 16-bit PNG; caller ownership is retained.
             agent_prompt: A high-level system prompt that subtly influences the avatar's
                 movements, expressions, and emotional demeanor.
             idle_timeout: Idle timeout in seconds.
@@ -71,8 +76,10 @@ class LemonSliceApi:
             Dictionary containing session_id, room_url, and control_url.
 
         Raises:
-            ValueError: If zero or more than one of agent_id, agent_image_url, or agent_image
-                is provided.
+            ValueError: If zero or more than one agent source is provided, or an
+                image is empty mode-I or has mode-I pixels outside 0..65535.
+            TypeError: If agent_image is not a PIL image. Other PNG encoder errors
+                propagate before the session request is submitted.
         """
         given_sources = [
             source for source in (agent_id, agent_image_url, agent_image) if source is not None
@@ -166,7 +173,29 @@ class LemonSliceApi:
 
 
 def _encode_image(image: Image.Image) -> bytes:
-    """Encode a PIL image as PNG bytes for a multipart upload."""
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
-    return buffer.getvalue()
+    """Encode a caller-owned PIL image as PNG bytes before any session upload.
+
+    Other PNG modes keep Pillow's existing encoder behavior. A mode-I image is
+    explicitly converted to unsigned 16-bit only if every pixel fits 0..65535;
+    empty or out-of-range integer images raise ValueError instead of clipping.
+    Non-images raise TypeError, and other Pillow errors propagate unchanged.
+    The temporary conversion/buffer are closed on success or error; the input
+    is never modified or closed. This helper performs no network request.
+    """
+    if not isinstance(image, Image.Image):
+        raise TypeError("PNG encoding requires a PIL.Image.Image")
+    encoded_image = image
+    if image.mode == "I":
+        extrema = image.getextrema()
+        if extrema is None:
+            raise ValueError("Cannot encode an empty mode I image as PNG")
+        if extrema[0] < 0 or extrema[1] > 65535:
+            raise ValueError("Mode I PNG pixels must be in 0..65535 for lossless encoding")
+        encoded_image = image.convert("I;16")
+    try:
+        with io.BytesIO() as buffer:
+            encoded_image.save(buffer, format="PNG")
+            return buffer.getvalue()
+    finally:
+        if encoded_image is not image:
+            encoded_image.close()
